@@ -1,0 +1,10 @@
+{
+  "base_url": "https://guardicore.example.com",
+  "username": "testuser",
+  "password": "testpassword",
+  "access_token": "",
+  "refresh_token": "",
+  "insecure_skip_verify": true,
+  "user_group_orchestration_id": "",
+  "user_group_group_id": ""
+}
