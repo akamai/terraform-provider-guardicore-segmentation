@@ -42,6 +42,7 @@ testconfig.json
 
 # Importer output
 imported/
+imported*/*.tf
 
 # Coverage output
 *.out
