@@ -22,7 +22,7 @@ A Terraform provider for managing resources in [Akamai Guardicore Segmentation](
 
 ## Documentation
 
-- **Full Documentation**: Available in the [`docs/`](docs/) directory and on the [Terraform Registry](https://registry.terraform.io/providers/akamai/guardicore/latest/docs)
+- **Full Documentation**: Available in the [`docs/`](docs/) directory and on the [Terraform Registry](https://registry.terraform.io/providers/akamai/guardicore-segmentation/latest/docs)
 
 ## Requirements
 
