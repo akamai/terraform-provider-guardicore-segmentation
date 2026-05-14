@@ -1,11 +1,14 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
 
@@ -494,6 +497,45 @@ func TestAccPolicyRuleResource_disabled(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestAccPolicyRuleResource_icmpEmptyCodesImport(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPolicyRuleResourceConfigICMPEmptyCodes(),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_policy_rule.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "icmp_matches.#", "1"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "icmp_matches.0.icmp_codes.#", "0"),
+				),
+			},
+			{
+				ResourceName:      "guardicore_policy_rule.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testAccPolicyRuleResourceConfigICMPEmptyCodes() string {
+	return testAccPolicyRuleTypedConfig(`  action           = "ALERT"
+  section_position = "ALERT"
+  enabled          = true
+  comments         = "ICMP with empty codes"
+
+  ip_protocols = ["ICMP"]
+
+  icmp_matches = [
+    {
+      icmp_type  = 8
+      icmp_codes = []
+      version    = "4"
+    },
+  ]`)
 }
 
 func testAccPolicyRuleResourceConfigDisabled() string {
@@ -1275,6 +1317,27 @@ func testAccPolicyRuleResourceConfigSimpleNoWorksite() string {
 func TestAccPolicyRuleResource_typedEndpointFieldsAndScope(t *testing.T) {
 	labelKey := testAccRandomName("tf-acc-scope-key")
 	labelValue := testAccRandomName("tf-acc-scope-value")
+	sourceLabelKeyA := testAccRandomName("tf-acc-src-label-key")
+	sourceLabelValueA := testAccRandomName("tf-acc-src-label-value")
+	sourceLabelKeyB := testAccRandomName("tf-acc-src-label-key")
+	sourceLabelValueB := testAccRandomName("tf-acc-src-label-value")
+	destLabelKeyA := testAccRandomName("tf-acc-dst-label-key")
+	destLabelValueA := testAccRandomName("tf-acc-dst-label-value")
+	destLabelKeyB := testAccRandomName("tf-acc-dst-label-key")
+	destLabelValueB := testAccRandomName("tf-acc-dst-label-value")
+
+	config := testAccPolicyRuleResourceConfigTypedEndpointFieldsAndScope(
+		labelKey,
+		labelValue,
+		sourceLabelKeyA,
+		sourceLabelValueA,
+		sourceLabelKeyB,
+		sourceLabelValueB,
+		destLabelKeyA,
+		destLabelValueA,
+		destLabelKeyB,
+		destLabelValueB,
+	)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -1282,24 +1345,70 @@ func TestAccPolicyRuleResource_typedEndpointFieldsAndScope(t *testing.T) {
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_policy_rule"),
 		Steps: []resource.TestStep{
 			{
-				Config: testAccPolicyRuleResourceConfigTypedEndpointFieldsAndScope(labelKey, labelValue),
+				Config: config,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("guardicore_policy_rule.test", "id"),
+					resource.TestCheckResourceAttrSet("guardicore_policy_rule.selector", "id"),
+					testAccCheckPolicyRevisionPublished("guardicore_policy_rule.test"),
+					testAccCheckPolicyRevisionPublished("guardicore_policy_rule.selector"),
 					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "source.processes.#", "1"),
 					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "source.windows_services.#", "1"),
 					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "source.windows_services.0.service_name", "Dnscache"),
 					resource.TestCheckResourceAttr("guardicore_policy_rule.test", "scope.#", "1"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.selector", "source.labels.or_labels.#", "1"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.selector", "source.labels.or_labels.0.and_labels.#", "2"),
+					resource.TestCheckResourceAttrPair("guardicore_policy_rule.selector", "source.labels.or_labels.0.and_labels.0", "guardicore_label.source_selector_a", "id"),
+					resource.TestCheckResourceAttrPair("guardicore_policy_rule.selector", "source.labels.or_labels.0.and_labels.1", "guardicore_label.source_selector_b", "id"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.selector", "destination.labels.or_labels.#", "1"),
+					resource.TestCheckResourceAttr("guardicore_policy_rule.selector", "destination.labels.or_labels.0.and_labels.#", "2"),
+					resource.TestCheckResourceAttrPair("guardicore_policy_rule.selector", "destination.labels.or_labels.0.and_labels.0", "guardicore_label.destination_selector_a", "id"),
+					resource.TestCheckResourceAttrPair("guardicore_policy_rule.selector", "destination.labels.or_labels.0.and_labels.1", "guardicore_label.destination_selector_b", "id"),
 				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
 			},
 		},
 	})
 }
 
-func testAccPolicyRuleResourceConfigTypedEndpointFieldsAndScope(labelKey, labelValue string) string {
+func testAccPolicyRuleResourceConfigTypedEndpointFieldsAndScope(
+	labelKey,
+	labelValue,
+	sourceLabelKeyA,
+	sourceLabelValueA,
+	sourceLabelKeyB,
+	sourceLabelValueB,
+	destLabelKeyA,
+	destLabelValueA,
+	destLabelKeyB,
+	destLabelValueB string,
+) string {
 	return testAccProviderConfig() + fmt.Sprintf(`
 resource "guardicore_label" "scope" {
   key   = %[1]q
   value = %[2]q
+}
+
+resource "guardicore_label" "source_selector_a" {
+  key   = %[3]q
+  value = %[4]q
+}
+
+resource "guardicore_label" "source_selector_b" {
+  key   = %[5]q
+  value = %[6]q
+}
+
+resource "guardicore_label" "destination_selector_a" {
+  key   = %[7]q
+  value = %[8]q
+}
+
+resource "guardicore_label" "destination_selector_b" {
+  key   = %[9]q
+  value = %[10]q
 }
 
 resource "guardicore_policy_rule" "test" {
@@ -1310,7 +1419,6 @@ resource "guardicore_policy_rule" "test" {
   scope            = [guardicore_label.scope.id]
 
 	  source = {
-	    address_classification = "Private"
 	    processes              = ["dns.exe"]
 	    windows_services = [
 	      {
@@ -1328,5 +1436,207 @@ resource "guardicore_policy_rule" "test" {
   ports        = [53]
   ip_protocols = ["UDP"]
 }
-`, labelKey, labelValue)
+
+resource "guardicore_policy_rule" "selector" {
+  action           = "ALLOW"
+  section_position = "ALLOW"
+  enabled          = true
+  comments         = "Typed source/destination labels selectors"
+
+  source = {
+    labels = {
+      or_labels = [
+        {
+          and_labels = [
+            guardicore_label.source_selector_a.id,
+            guardicore_label.source_selector_b.id,
+          ]
+        },
+      ]
+    }
+  }
+
+  destination = {
+    labels = {
+      or_labels = [
+        {
+          and_labels = [
+            guardicore_label.destination_selector_a.id,
+            guardicore_label.destination_selector_b.id,
+          ]
+        },
+      ]
+    }
+  }
+
+  ports        = [443]
+  ip_protocols = ["TCP"]
+}
+`, labelKey, labelValue, sourceLabelKeyA, sourceLabelValueA, sourceLabelKeyB, sourceLabelValueB, destLabelKeyA, destLabelValueA, destLabelKeyB, destLabelValueB)
+}
+
+func TestUpdatePolicyRuleModelFromAPI_preservesEmptyLists(t *testing.T) {
+	ctx := context.Background()
+	emptyIntList, _ := types.ListValueFrom(ctx, types.Int64Type, []int64{})
+	emptyStringList, _ := types.ListValueFrom(ctx, types.StringType, []string{})
+	emptyRangeList, _ := types.ListValueFrom(ctx, types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()}, []attr.Value{})
+
+	tests := []struct {
+		name  string
+		field string
+		model func() *PolicyRuleResourceModel
+	}{
+		{
+			name:  "ports empty list preserved",
+			field: "Ports",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{Ports: emptyIntList}
+			},
+		},
+		{
+			name:  "exclude_ports empty list preserved",
+			field: "ExcludePorts",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{ExcludePorts: emptyIntList}
+			},
+		},
+		{
+			name:  "ip_protocols empty list preserved",
+			field: "IPProtocols",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{IPProtocols: emptyStringList}
+			},
+		},
+		{
+			name:  "scope empty list preserved",
+			field: "Scope",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{Scope: emptyStringList}
+			},
+		},
+		{
+			name:  "port_ranges empty list preserved",
+			field: "PortRanges",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{PortRanges: emptyRangeList}
+			},
+		},
+		{
+			name:  "exclude_port_ranges empty list preserved",
+			field: "ExcludePortRanges",
+			model: func() *PolicyRuleResourceModel {
+				return &PolicyRuleResourceModel{ExcludePortRanges: emptyRangeList}
+			},
+		},
+	}
+
+	apiRule := map[string]interface{}{
+		"action":           "ALLOW",
+		"section_position": "ALLOW",
+		"enabled":          true,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := tt.model()
+			diags := updatePolicyRuleModelFromAPI(ctx, data, apiRule, apiRule)
+			if diags.HasError() {
+				t.Fatalf("unexpected diagnostics: %v", diags)
+			}
+
+			var got types.List
+			switch tt.field {
+			case "Ports":
+				got = data.Ports
+			case "ExcludePorts":
+				got = data.ExcludePorts
+			case "IPProtocols":
+				got = data.IPProtocols
+			case "Scope":
+				got = data.Scope
+			case "PortRanges":
+				got = data.PortRanges
+			case "ExcludePortRanges":
+				got = data.ExcludePortRanges
+			}
+
+			if got.IsNull() {
+				t.Fatalf("expected empty list, got null")
+			}
+			if len(got.Elements()) != 0 {
+				t.Fatalf("expected 0 elements, got %d", len(got.Elements()))
+			}
+		})
+	}
+}
+
+func TestUpdatePolicyRuleModelFromAPI_preservesEmptyPortsWhenEffectiveSpecOmitsPorts(t *testing.T) {
+	ctx := context.Background()
+	emptyPorts, _ := types.ListValueFrom(ctx, types.Int64Type, []int64{})
+
+	data := &PolicyRuleResourceModel{Ports: emptyPorts}
+	apiRule := map[string]interface{}{
+		"action":           "BLOCK",
+		"section_position": "BLOCK",
+		"enabled":          true,
+	}
+	effectiveSpec := map[string]interface{}{
+		"action":           "BLOCK",
+		"section_position": "BLOCK",
+		"enabled":          true,
+		"source":           map[string]interface{}{"processes": []interface{}{"/usr/bin/curl"}},
+		"destination":      map[string]interface{}{"address_classification": "Internet"},
+	}
+
+	diags := updatePolicyRuleModelFromAPI(ctx, data, apiRule, effectiveSpec)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+
+	if data.Ports.IsNull() {
+		t.Fatal("expected empty ports list, got null")
+	}
+	if len(data.Ports.Elements()) != 0 {
+		t.Fatalf("expected 0 ports, got %d", len(data.Ports.Elements()))
+	}
+}
+
+func TestUpdatePolicyRuleModelFromAPI_nullListsStayNull(t *testing.T) {
+	ctx := context.Background()
+
+	data := &PolicyRuleResourceModel{
+		Ports:             types.ListNull(types.Int64Type),
+		ExcludePorts:      types.ListNull(types.Int64Type),
+		IPProtocols:       types.ListNull(types.StringType),
+		Scope:             types.ListNull(types.StringType),
+		PortRanges:        types.ListNull(types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()}),
+		ExcludePortRanges: types.ListNull(types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()}),
+	}
+
+	apiRule := map[string]interface{}{
+		"action":           "ALLOW",
+		"section_position": "ALLOW",
+		"enabled":          true,
+	}
+
+	diags := updatePolicyRuleModelFromAPI(ctx, data, apiRule, apiRule)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  types.List
+	}{
+		{"Ports", data.Ports},
+		{"ExcludePorts", data.ExcludePorts},
+		{"IPProtocols", data.IPProtocols},
+		{"Scope", data.Scope},
+		{"PortRanges", data.PortRanges},
+		{"ExcludePortRanges", data.ExcludePortRanges},
+	} {
+		if !tc.got.IsNull() {
+			t.Errorf("%s: expected null, got non-null list with %d elements", tc.name, len(tc.got.Elements()))
+		}
+	}
 }

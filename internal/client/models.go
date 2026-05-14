@@ -1,6 +1,9 @@
 package client
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // LabelCreate is used for create/update requests (uses "criteria" field).
 type LabelCreate struct {
@@ -10,7 +13,7 @@ type LabelCreate struct {
 	Criteria []LabelCriteria `json:"criteria"`
 }
 
-// LabelUpdate is used for update requests when criteria is omitted.
+// LabelUpdate is used for update requests.
 type LabelUpdate struct {
 	Key      string          `json:"key"`
 	Value    string          `json:"value"`
@@ -22,15 +25,71 @@ type Label struct {
 	ID              string          `json:"id,omitempty"`
 	Key             string          `json:"key"`
 	Value           string          `json:"value"`
+	Origin          *string         `json:"origin,omitempty"`
+	ReadOnly        *bool           `json:"read_only,omitempty"`
 	DynamicCriteria []LabelCriteria `json:"dynamic_criteria,omitempty"`
 	StaticCriteria  []LabelCriteria `json:"static_criteria,omitempty"`
 }
 
 // LabelCriteria represents criteria for dynamic label assignment.
 type LabelCriteria struct {
+	ID               string          `json:"id,omitempty"`
+	Field            string          `json:"field"`
+	Op               string          `json:"op"`
+	Argument         string          `json:"argument"`
+	CompoundCriteria []LabelCriteria `json:"compound_criteria,omitempty"`
+	Source           *string         `json:"source,omitempty"`
+	ReadOnly         *bool           `json:"read_only,omitempty"`
+}
+
+// LabelDynamicCompoundCriterion is an inner member of a compound criterion.
+// Inner members do not have IDs.
+type LabelDynamicCompoundCriterion struct {
 	Field    string `json:"field"`
 	Op       string `json:"op"`
 	Argument string `json:"argument"`
+}
+
+// LabelDynamicCriterionChange is a top-level dynamic criterion change item.
+// A criterion is either flat (field/op/argument) or compound_criteria.
+type LabelDynamicCriterionChange struct {
+	ID               string                          `json:"id"`
+	Source           string                          `json:"source"`
+	Field            string                          `json:"field,omitempty"`
+	Op               string                          `json:"op,omitempty"`
+	Argument         string                          `json:"argument,omitempty"`
+	CompoundCriteria []LabelDynamicCompoundCriterion `json:"compound_criteria,omitempty"`
+}
+
+// LabelDynamicCriteriaChangesRequest is the payload for applying add/modify/delete
+// changes to an existing label's dynamic criteria.
+type LabelDynamicCriteriaChangesRequest struct {
+	Added    []LabelDynamicCriterionChange `json:"added"`
+	Modified []LabelDynamicCriterionChange `json:"modified"`
+	Deleted  []string                      `json:"deleted"`
+}
+
+// IsReadOnlyWorksiteGenerated reports whether this criterion is API-generated
+// for Worksite scoping and therefore not user-manageable.
+func (c LabelCriteria) IsReadOnlyWorksiteGenerated() bool {
+	if c.ReadOnly != nil && *c.ReadOnly && c.Source != nil && strings.EqualFold(*c.Source, "Worksite") {
+		return true
+	}
+
+	return strings.EqualFold(c.Field, "scoping_details.worksite.id")
+}
+
+// LabelBulkResponse represents bulk label create/update/delete operation results.
+type LabelBulkResponse struct {
+	Result    string   `json:"result"`
+	Succeeded []string `json:"succeeded"`
+	Failed    []string `json:"failed"`
+	Missing   []string `json:"missing"`
+}
+
+// LabelBulkDeleteItem represents a single item in a bulk label delete request.
+type LabelBulkDeleteItem struct {
+	ID string `json:"id"`
 }
 
 // LabelGroupCreate is used for create/update requests (uses string IDs for labels).
@@ -129,6 +188,17 @@ type PolicyRulesBulkCreateResponse struct {
 	TotalNumber       int      `json:"total_number"`
 }
 
+// PolicyRuleBulkUpdateItem represents a single item in a bulk policy rule update request.
+type PolicyRuleBulkUpdateItem struct {
+	ID   string         `json:"id"`
+	Rule map[string]any `json:"rule"`
+}
+
+// PolicyRuleBulkDeleteItem represents a single item in a bulk policy rule delete request.
+type PolicyRuleBulkDeleteItem struct {
+	ID string `json:"id"`
+}
+
 // PolicyRevisionRequest represents a policy revision publish request.
 type PolicyRevisionRequest struct {
 	Comments                string   `json:"comments"`
@@ -137,6 +207,11 @@ type PolicyRevisionRequest struct {
 	ResetHitCount           bool     `json:"reset_hit_count,omitempty"`
 	ResetHitCountForRuleset bool     `json:"reset_hit_count_for_ruleset,omitempty"`
 	Origin                  *string  `json:"origin,omitempty"`
+}
+
+// UserGroupRevisionRequest represents a user group revision publish request.
+type UserGroupRevisionRequest struct {
+	Comments string `json:"comments"`
 }
 
 // ListLabelsResponse represents the response from listing labels.
@@ -296,6 +371,17 @@ type DeleteWorksitesNegate struct {
 	Quantity   int            `json:"quantity"`
 }
 
+// DeleteWorksitesResponse represents the response from POST /worksites/delete_worksites.
+// The API can return HTTP 200 with per-item skip/failure counts when deletions are blocked.
+type DeleteWorksitesResponse struct {
+	AssignedDetails   string `json:"assigned_details"`
+	AssignedWorksites int    `json:"assigned_worksites"`
+	Details           string `json:"details"`
+	Failures          int    `json:"failures"`
+	Skips             int    `json:"skips"`
+	Successes         int    `json:"successes"`
+}
+
 // OrchestrationGroup represents a single orchestration with its AD groups.
 type OrchestrationGroup struct {
 	OrchestrationID string   `json:"orchestration_id"`
@@ -308,11 +394,25 @@ type UserGroupCreate struct {
 	OrchestrationsGroups []OrchestrationGroup `json:"orchestrations_groups"`
 }
 
+// DomainGroup represents a single group within a domain in the list response.
+type DomainGroup struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// DomainGroupInfo represents orchestration information for a domain in the list response.
+// The list API returns groups_by_domain_name with this structure instead of orchestrations_groups.
+type DomainGroupInfo struct {
+	Groups          []DomainGroup `json:"groups"`
+	OrchestrationID string        `json:"orchestration_id"`
+}
+
 // UserGroup is used for reading user groups from the API.
 type UserGroup struct {
-	ID                   string               `json:"id"`
-	Title                string               `json:"title"`
-	OrchestrationsGroups []OrchestrationGroup `json:"orchestrations_groups"`
+	ID                   string                     `json:"id"`
+	Title                string                     `json:"title"`
+	OrchestrationsGroups []OrchestrationGroup       `json:"orchestrations_groups"`
+	GroupsByDomainName   map[string]DomainGroupInfo `json:"groups_by_domain_name,omitempty"`
 }
 
 // ListUserGroupsResponse represents the response from listing user groups.
@@ -328,43 +428,33 @@ type AssetNIC struct {
 	NetworkID            string   `json:"network_id,omitempty"`
 	NetworkName          string   `json:"network_name,omitempty"`
 	IsCloudPublic        *bool    `json:"is_cloud_public,omitempty"`
-	IsCorporateInterface bool     `json:"is_corporate_interface,omitempty"`
+	IsCorporateInterface *bool    `json:"is_corporate_interface,omitempty"`
 	SwitchID             string   `json:"switch_id,omitempty"`
 	IPAddresses          []string `json:"ip_addresses"`
 }
 
 // AssetLabelRef represents a label reference on an asset.
 type AssetLabelRef struct {
-	ID    string `json:"id,omitempty"`
-	Key   string `json:"key,omitempty"`
-	Value string `json:"value,omitempty"`
+	ID       string  `json:"id,omitempty"`
+	Key      string  `json:"key,omitempty"`
+	Value    string  `json:"value,omitempty"`
+	Origin   *string `json:"origin,omitempty"`
+	ReadOnly *bool   `json:"read_only,omitempty"`
 }
 
-// AssetCreate is used for POST create requests to /api/v4.0/assets/.
+// AssetCreate is used for POST /api/v4.0/assets/bulk create requests.
 type AssetCreate struct {
-	Name                  string          `json:"name"`
-	Nics                  []AssetNIC      `json:"nics"`
-	OrchestrationObjID    string          `json:"orchestration_obj_id"`
-	Status                string          `json:"status,omitempty"`
-	Labels                []AssetLabelRef `json:"labels,omitempty"`
-	Comments              string          `json:"comments,omitempty"`
-	OrchestrationMetadata json.RawMessage `json:"orchestration_metadata,omitempty"`
-	Worksite              *string         `json:"worksite,omitempty"`
-	InstanceID            string          `json:"instance_id,omitempty"`
-	HwUUID                string          `json:"hw_uuid,omitempty"`
-	BiosUUID              string          `json:"bios_uuid,omitempty"`
-}
-
-// AssetUpdate is used for PUT update requests to /api/v4.0/assets/{asset_id}.
-// NOTE: orchestration_obj_id, instance_id, hw_uuid, bios_uuid are NOT in the edit body.
-type AssetUpdate struct {
-	Name                  string          `json:"name,omitempty"`
-	Nics                  []AssetNIC      `json:"nics,omitempty"`
-	Status                string          `json:"status,omitempty"`
-	Labels                []AssetLabelRef `json:"labels,omitempty"`
-	Comments              string          `json:"comments,omitempty"`
-	OrchestrationMetadata json.RawMessage `json:"orchestration_metadata,omitempty"`
-	Worksite              *string         `json:"worksite,omitempty"`
+	Name                  string           `json:"name"`
+	Nics                  []AssetNIC       `json:"nics"`
+	OrchestrationObjID    string           `json:"orchestration_obj_id"`
+	Status                string           `json:"status,omitempty"`
+	Labels                *[]AssetLabelRef `json:"labels,omitempty"`
+	Comments              string           `json:"comments,omitempty"`
+	OrchestrationMetadata json.RawMessage  `json:"orchestration_metadata,omitempty"`
+	Worksite              *string          `json:"worksite,omitempty"`
+	InstanceID            string           `json:"instance_id,omitempty"`
+	HwUUID                string           `json:"hw_uuid,omitempty"`
+	BiosUUID              string           `json:"bios_uuid,omitempty"`
 }
 
 // OrchestrationDetail represents an entry in the orchestration_details array returned by the API.
@@ -407,33 +497,52 @@ type Asset struct {
 	ScopingDetails        *AssetScopingDetails  `json:"scoping_details,omitempty"`
 }
 
-// CreateAssetResponse represents the response from creating an asset.
-// NOTE: Uses asset_id, not id (unlike most other resources).
-type CreateAssetResponse struct {
-	AssetID string `json:"asset_id"`
-}
-
 // ListAssetsResponse represents the response from listing assets.
+// The assets API returns "total" (not "total_count" like labels/label groups).
 type ListAssetsResponse struct {
 	Objects    []Asset `json:"objects"`
-	TotalCount int     `json:"total_count"`
+	TotalCount int     `json:"total"`
 }
 
 // AssetBulkUpdateItem represents a single item in a bulk update request.
 type AssetBulkUpdateItem struct {
-	AssetID               string          `json:"asset_id"`
-	Name                  string          `json:"name,omitempty"`
-	Nics                  []AssetNIC      `json:"nics,omitempty"`
-	Status                string          `json:"status,omitempty"`
-	Labels                []AssetLabelRef `json:"labels,omitempty"`
-	Comments              string          `json:"comments,omitempty"`
-	OrchestrationMetadata json.RawMessage `json:"orchestration_metadata,omitempty"`
-	Worksite              *string         `json:"worksite,omitempty"`
+	AssetID               string           `json:"asset_id"`
+	Name                  string           `json:"name,omitempty"`
+	Nics                  []AssetNIC       `json:"nics,omitempty"`
+	Status                string           `json:"status,omitempty"`
+	Labels                *[]AssetLabelRef `json:"labels,omitempty"`
+	Comments              string           `json:"comments,omitempty"`
+	OrchestrationMetadata json.RawMessage  `json:"orchestration_metadata,omitempty"`
+	Worksite              *string          `json:"worksite,omitempty"`
 }
 
 // BulkDeactivateAssetItem represents a single item in a bulk deactivate request.
 type BulkDeactivateAssetItem struct {
 	AssetID string `json:"asset_id"`
+}
+
+// BulkAssetError represents an individual error entry in a bulk asset response.
+type BulkAssetError struct {
+	Error              string `json:"error"`
+	OrchestrationObjID string `json:"orchestration_obj_id"`
+	AssetID            string `json:"asset_id"`
+}
+
+// BulkCreateAssetsResponse represents the response from POST /api/v4.0/assets/bulk.
+type BulkCreateAssetsResponse struct {
+	NumberOfSucceeded int               `json:"number_of_succeeded"`
+	NumberOfFailed    int               `json:"number_of_failed"`
+	TotalNumber       int               `json:"total_number"`
+	Errors            []BulkAssetError  `json:"errors"`
+	CreatedAssetIDs   map[string]string `json:"created_asset_ids"`
+}
+
+// BulkUpdateAssetsResponse represents the response from PUT /api/v4.0/assets/bulk.
+type BulkUpdateAssetsResponse struct {
+	NumberOfSucceeded int              `json:"number_of_succeeded"`
+	NumberOfFailed    int              `json:"number_of_failed"`
+	TotalNumber       int              `json:"total_number"`
+	Errors            []BulkAssetError `json:"errors"`
 }
 
 // WorksiteAssignRequest is used for POST /api/v4.0/worksites/assign to assign entities to a worksite.
@@ -493,4 +602,69 @@ type PolicyGroup struct {
 type ListPolicyGroupsResponse struct {
 	Objects    []PolicyGroup `json:"objects"`
 	TotalCount int           `json:"total_count"`
+}
+
+// Agent Aggregator models (read-only)
+
+type AgentAggregatorFullVersion struct {
+	Major string `json:"major"`
+	Minor string `json:"minor"`
+	Tag   string `json:"tag"`
+}
+
+type AgentAggregatorInterface struct {
+	Interface string `json:"interface"`
+	IPAddress string `json:"ip_address"`
+	Netmask   string `json:"netmask"`
+}
+
+type AgentAggregator struct {
+	ID                          string                      `json:"id"`
+	InternalID                  string                      `json:"_id"`
+	Cls                         string                      `json:"_cls"`
+	ComponentID                 string                      `json:"component_id"`
+	AgentID                     string                      `json:"agent_id"`
+	Version                     string                      `json:"version"`
+	FullVersion                 *AgentAggregatorFullVersion `json:"full_version,omitempty"`
+	BuildCommit                 string                      `json:"build_commit"`
+	BuildDate                   any                         `json:"build_date,omitempty"`
+	InstallDate                 any                         `json:"install_date,omitempty"`
+	IPAddress                   string                      `json:"ip_address"`
+	Hostname                    string                      `json:"hostname"`
+	Interfaces                  []AgentAggregatorInterface  `json:"interfaces,omitempty"`
+	FirstSeen                   any                         `json:"first_seen,omitempty"`
+	AssociatedMgmtConfiguration json.RawMessage             `json:"associated_mgmt_configuration,omitempty"`
+	DocVersion                  int                         `json:"doc_version"`
+	LastSeen                    any                         `json:"last_seen,omitempty"`
+	DisplayStatus               string                      `json:"display_status"`
+	IsMissing                   bool                        `json:"is_missing"`
+	State                       string                      `json:"state"`
+	AggregatorType              string                      `json:"aggregator_type"`
+	AggregatorFeatures          []string                    `json:"aggregator_features,omitempty"`
+	ClusterID                   string                      `json:"cluster_id"`
+	ZookeeperID                 int                         `json:"zookeeper_id"`
+	SubComponents               []string                    `json:"sub_components,omitempty"`
+	NetworkDevices              json.RawMessage             `json:"network_devices,omitempty"`
+	IntegrationSDKCapabilities  []string                    `json:"integration_sdk_capabilities,omitempty"`
+	ManagementHosts             []string                    `json:"management_hosts,omitempty"`
+	ExternalFQDNAddresses       []string                    `json:"external_fqdn_addresses,omitempty"`
+	AggrCertSerialNumber        string                      `json:"aggr_cert_serial_number"`
+	CollectorType               *string                     `json:"collector_type"`
+	LegacyComponentID           string                      `json:"component-id"`
+	EnforcementID               string                      `json:"enforcement-id"`
+	EventletVersion             string                      `json:"eventlet-version"`
+	ExternalAddress             string                      `json:"external-address"`
+	HostIPs                     []string                    `json:"host_ips,omitempty"`
+	InternalAddress             string                      `json:"internal-address"`
+	ManagementHost              string                      `json:"management_host"`
+	SystemUptime                string                      `json:"system-uptime"`
+	GuestInstallationDetails    json.RawMessage             `json:"guest_installation_details,omitempty"`
+	MitigationID                string                      `json:"mitigation-id"`
+	TenantName                  *string                     `json:"tenant_name"`
+	IsConfigurationDirty        bool                        `json:"is_configuration_dirty"`
+}
+
+type ListAgentAggregatorsResponse struct {
+	Objects    []AgentAggregator `json:"objects"`
+	TotalCount int               `json:"total_count"`
 }

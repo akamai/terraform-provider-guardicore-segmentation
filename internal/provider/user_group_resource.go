@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -29,6 +30,9 @@ func NewUserGroupResource() resource.Resource {
 // UserGroupResource defines the resource implementation.
 type UserGroupResource struct {
 	client                *client.Client
+	createBatcher         *Batcher[*client.UserGroupCreate, string]
+	updateBatcher         *Batcher[userGroupUpdateReq, struct{}]
+	deleteBatcher         *Batcher[string, struct{}]
 	validateRefsOnDestroy bool
 	strictRefsOnDestroy   bool
 }
@@ -44,6 +48,8 @@ type UserGroupResourceModel struct {
 	ID                   types.String              `tfsdk:"id"`
 	Title                types.String              `tfsdk:"title"`
 	OrchestrationsGroups []OrchestrationGroupModel `tfsdk:"orchestrations_groups"`
+	SystemManaged        types.Bool                `tfsdk:"system_managed"`
+	ManagedBy            types.String              `tfsdk:"managed_by"`
 }
 
 func (r *UserGroupResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -52,7 +58,12 @@ func (r *UserGroupResource) Metadata(ctx context.Context, req resource.MetadataR
 
 func (r *UserGroupResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Manages a user group in Akamai Guardicore Segmentation. User groups associate Active Directory orchestration groups for use in visibility policies.",
+		MarkdownDescription: "Manages a user group in Akamai Guardicore Segmentation.\n\n" +
+			"Some user groups are system-managed (e.g., local system groups with all orchestration IDs set to \"local\"). " +
+			"System-managed groups can be read and referenced in policy rules, but cannot be updated or deleted by Terraform.\n\n" +
+			"Use this resource for user groups that Terraform should create and manage. " +
+			"Use the `guardicore_user_group` data source to reference existing system-managed groups.\n\n" +
+			"When `system_managed` is `true`, any attempt to update or delete the user group will return an error.",
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -95,6 +106,20 @@ func (r *UserGroupResource) Schema(ctx context.Context, req resource.SchemaReque
 					},
 				},
 			},
+			"system_managed": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether this user group is system-managed. System-managed groups cannot be updated or deleted by Terraform. Use the `guardicore_user_group` data source to reference them.",
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"managed_by": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Identifies who manages this user group. `terraform` for user-managed groups, or `system` for platform-managed groups.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 		},
 	}
 }
@@ -114,6 +139,9 @@ func (r *UserGroupResource) Configure(ctx context.Context, req resource.Configur
 	}
 
 	r.client = providerData.Client
+	r.createBatcher = providerData.UserGroupCreateBatcher
+	r.updateBatcher = providerData.UserGroupUpdateBatcher
+	r.deleteBatcher = providerData.UserGroupDeleteBatcher
 	r.validateRefsOnDestroy = providerData.ValidateRefsOnDestroy
 	r.strictRefsOnDestroy = providerData.StrictRefsOnDestroy
 }
@@ -131,7 +159,7 @@ func (r *UserGroupResource) Create(ctx context.Context, req resource.CreateReque
 		return
 	}
 
-	id, err := r.client.CreateUserGroup(ctx, apiReq)
+	id, err := r.createBatcher.Enqueue(ctx, apiReq)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create user group, got error: %s", err))
 		return
@@ -148,6 +176,9 @@ func (r *UserGroupResource) Create(ctx context.Context, req resource.CreateReque
 	if created != nil {
 		r.apiToModel(ctx, created, &data, &resp.Diagnostics)
 	}
+
+	data.SystemManaged = types.BoolValue(false)
+	data.ManagedBy = types.StringValue("terraform")
 
 	tflog.Trace(ctx, "created user group", map[string]any{"id": id})
 
@@ -175,13 +206,28 @@ func (r *UserGroupResource) Read(ctx context.Context, req resource.ReadRequest, 
 
 	r.apiToModel(ctx, userGroup, &data, &resp.Diagnostics)
 
+	sm, mb := UserGroupIsSystemManaged(userGroup)
+	data.SystemManaged = types.BoolValue(sm)
+	data.ManagedBy = types.StringValue(mb)
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
 func (r *UserGroupResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var data UserGroupResourceModel
+	var stateData UserGroupResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &stateData)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	DiagnoseSystemManagedMutation(stateData.SystemManaged, "user_group", data.ID.ValueString(), "update", &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -191,7 +237,10 @@ func (r *UserGroupResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	err := r.client.UpdateUserGroup(ctx, data.ID.ValueString(), apiReq)
+	_, err := r.updateBatcher.Enqueue(ctx, userGroupUpdateReq{
+		id:        data.ID.ValueString(),
+		userGroup: apiReq,
+	})
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update user group, got error: %s", err))
 		return
@@ -205,6 +254,9 @@ func (r *UserGroupResource) Update(ctx context.Context, req resource.UpdateReque
 	}
 	if updated != nil {
 		r.apiToModel(ctx, updated, &data, &resp.Diagnostics)
+		sm, mb := UserGroupIsSystemManaged(updated)
+		data.SystemManaged = types.BoolValue(sm)
+		data.ManagedBy = types.StringValue(mb)
 	}
 
 	tflog.Trace(ctx, "updated user group", map[string]any{"id": data.ID.ValueString()})
@@ -220,6 +272,11 @@ func (r *UserGroupResource) Delete(ctx context.Context, req resource.DeleteReque
 		return
 	}
 
+	DiagnoseSystemManagedMutation(data.SystemManaged, "user_group", data.ID.ValueString(), "delete", &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Check for references from policy rules before destroying
 	if r.validateRefsOnDestroy {
 		r.checkUserGroupReferencesOnDestroy(ctx, data.ID.ValueString(), r.strictRefsOnDestroy, &resp.Diagnostics)
@@ -228,7 +285,7 @@ func (r *UserGroupResource) Delete(ctx context.Context, req resource.DeleteReque
 		}
 	}
 
-	err := r.client.DeleteUserGroup(ctx, data.ID.ValueString())
+	_, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete user group, got error: %s", err))
 		return
@@ -263,17 +320,44 @@ func (r *UserGroupResource) modelToAPI(ctx context.Context, data *UserGroupResou
 func (r *UserGroupResource) apiToModel(ctx context.Context, userGroup *client.UserGroup, data *UserGroupResourceModel, diags *diag.Diagnostics) {
 	data.ID = types.StringValue(userGroup.ID)
 	data.Title = types.StringValue(userGroup.Title)
+	data.OrchestrationsGroups = resolveOrchestrationGroups(ctx, userGroup, diags)
+}
 
-	orchGroups := make([]OrchestrationGroupModel, len(userGroup.OrchestrationsGroups))
-	for i, og := range userGroup.OrchestrationsGroups {
-		groupsList, d := types.ListValueFrom(ctx, types.StringType, og.Groups)
-		diags.Append(d...)
-		orchGroups[i] = OrchestrationGroupModel{
-			OrchestrationID: types.StringValue(og.OrchestrationID),
-			Groups:          groupsList,
+// resolveOrchestrationGroups builds OrchestrationGroupModel from a UserGroup,
+// preferring OrchestrationsGroups (create/update response) and falling back to
+// GroupsByDomainName (list response) when the former is empty.
+func resolveOrchestrationGroups(ctx context.Context, userGroup *client.UserGroup, diags *diag.Diagnostics) []OrchestrationGroupModel {
+	if len(userGroup.OrchestrationsGroups) > 0 {
+		result := make([]OrchestrationGroupModel, len(userGroup.OrchestrationsGroups))
+		for i, og := range userGroup.OrchestrationsGroups {
+			groupsList, d := types.ListValueFrom(ctx, types.StringType, og.Groups)
+			diags.Append(d...)
+			result[i] = OrchestrationGroupModel{
+				OrchestrationID: types.StringValue(og.OrchestrationID),
+				Groups:          groupsList,
+			}
 		}
+		return result
 	}
-	data.OrchestrationsGroups = orchGroups
+
+	if len(userGroup.GroupsByDomainName) > 0 {
+		var result []OrchestrationGroupModel
+		for _, domainInfo := range userGroup.GroupsByDomainName {
+			var groupIDs []string
+			for _, g := range domainInfo.Groups {
+				groupIDs = append(groupIDs, g.ID)
+			}
+			groupsList, d := types.ListValueFrom(ctx, types.StringType, groupIDs)
+			diags.Append(d...)
+			result = append(result, OrchestrationGroupModel{
+				OrchestrationID: types.StringValue(domainInfo.OrchestrationID),
+				Groups:          groupsList,
+			})
+		}
+		return result
+	}
+
+	return nil
 }
 
 // checkUserGroupReferencesOnDestroy checks if any policy rules reference this

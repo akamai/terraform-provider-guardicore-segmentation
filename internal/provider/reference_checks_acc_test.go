@@ -66,6 +66,38 @@ resource "guardicore_policy_rule" "test" {
 	})
 }
 
+// TestAccPolicyRuleResource_invalidUserGroupRefShape tests that plan-time validation
+// rejects non-string user_group_ids entries in raw_spec_json.
+func TestAccPolicyRuleResource_invalidUserGroupRefShape(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccProviderConfig() + `
+resource "guardicore_policy_rule" "test" {
+  action           = "ALLOW"
+  section_position = "ALLOW"
+  enabled          = true
+
+  raw_spec_json = jsonencode({
+    source = {
+      user_group_ids = [{
+        id   = "local_administrators"
+        name = "Local Administrators"
+      }]
+    }
+    destination = {
+      any = true
+    }
+  })
+}`,
+				ExpectError: regexp.MustCompile(`(?i)Invalid Policy Rule Endpoint Reference|policy_rule\.source\.user_group_ids\[0\]`),
+			},
+		},
+	})
+}
+
 // TestAccAssetResource_invalidLabelRef tests that creating an asset
 // with a non-existent label ID produces a clear error.
 func TestAccAssetResource_invalidLabelRef(t *testing.T) {

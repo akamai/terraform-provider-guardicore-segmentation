@@ -44,8 +44,7 @@ func (p *GuardicoreProvider) Metadata(ctx context.Context, req provider.Metadata
 
 func (p *GuardicoreProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "The Akamai Guardicore Segmentation provider is used to interact with the Akamai Guardicore Segmentation API. " +
-			"It provides resources to manage labels, label groups, policy rules, policy groups, DNS security blocklists, incidents, worksites, user groups, and assets.",
+		MarkdownDescription: "Use the Akamai Guardicore Segmentation provider to manage labels, label groups, policy rules, policy groups, DNS security blocklists, incidents, worksites, user groups, and assets through the Akamai Guardicore Segmentation API.",
 		Attributes: map[string]schema.Attribute{
 			"base_url": schema.StringAttribute{
 				MarkdownDescription: "The base URL of the Akamai Guardicore Segmentation API (e.g., https://guardicore.example.com). Can also be set via GUARDICORE_BASE_URL environment variable.",
@@ -173,7 +172,10 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 		RefreshToken:       refreshToken,
 		InsecureSkipVerify: insecureSkipVerify,
 		RequestTimeout:     requestTimeout,
+		RuntimeSettings:    nil,
 	}
+	runtime := client.ResolveRuntimeSettings(config.RuntimeSettings)
+	assetLabelIgnoreCache := newAssetLabelIgnoreCache()
 
 	// Create the API client
 	apiClient, err := client.NewClient(config)
@@ -190,10 +192,31 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 	// Wrap the client with provider-level configuration
 	strictRefs := data.StrictRefsOnDestroy.ValueBool()
 	providerData := &ProviderData{
-		Client:                apiClient,
-		PolicyRuleBatcher:     NewPolicyRuleCreateBatcher(apiClient),
-		ValidateRefsOnDestroy: data.ValidateRefsOnDestroy.ValueBool() || strictRefs,
-		StrictRefsOnDestroy:   strictRefs,
+		Client:                   apiClient,
+		RuntimeSettings:          runtime,
+		AssetLabelIgnoreCache:    assetLabelIgnoreCache,
+		LabelCreateBatcher:       NewLabelCreateBatcher(apiClient, runtime.Batchers.Label.Create),
+		LabelUpdateBatcher:       NewLabelUpdateBatcher(apiClient, runtime.Batchers.Label.Update),
+		LabelDeleteBatcher:       NewLabelDeleteBatcher(apiClient, runtime.Batchers.Label.Delete),
+		PolicyRuleCreateBatcher:  NewPolicyRuleCreateBatcher(apiClient, runtime.Batchers.PolicyRule.Create),
+		PolicyRuleUpdateBatcher:  NewPolicyRuleUpdateBatcher(apiClient, runtime.Batchers.PolicyRule.Update),
+		PolicyRuleDeleteBatcher:  NewPolicyRuleDeleteBatcher(apiClient, runtime.Batchers.PolicyRule.Delete),
+		LabelGroupCreateBatcher:  NewLabelGroupCreateBatcher(apiClient, runtime.Batchers.LabelGroup.Create),
+		LabelGroupUpdateBatcher:  NewLabelGroupUpdateBatcher(apiClient, runtime.Batchers.LabelGroup.Update),
+		LabelGroupDeleteBatcher:  NewLabelGroupDeleteBatcher(apiClient, runtime.Batchers.LabelGroup.Delete),
+		UserGroupCreateBatcher:   NewUserGroupCreateBatcher(apiClient, runtime.Batchers.UserGroup.Create),
+		UserGroupUpdateBatcher:   NewUserGroupUpdateBatcher(apiClient, runtime.Batchers.UserGroup.Update),
+		UserGroupDeleteBatcher:   NewUserGroupDeleteBatcher(apiClient, runtime.Batchers.UserGroup.Delete),
+		AssetCreateBatcher:       NewAssetCreateBatcher(apiClient, runtime.Batchers.Asset.Create),
+		AssetUpdateBatcher:       NewAssetUpdateBatcher(apiClient, runtime.Batchers.Asset.Update),
+		AssetDeleteBatcher:       NewAssetDeleteBatcher(apiClient, runtime.Batchers.Asset.Delete),
+		DnsSecurityCreateBatcher: NewDnsSecurityCreateBatcher(apiClient, runtime.Batchers.DnsSecurity.Create),
+		DnsSecurityUpdateBatcher: NewDnsSecurityUpdateBatcher(apiClient, runtime.Batchers.DnsSecurity.Update),
+		DnsSecurityDeleteBatcher: NewDnsSecurityDeleteBatcher(apiClient, runtime.Batchers.DnsSecurity.Delete),
+		IncidentCreateBatcher:    NewIncidentCreateBatcher(apiClient, runtime.Batchers.Incident.Create),
+		WorksiteDeleteBatcher:    NewWorksiteDeleteBatcher(apiClient, runtime.Batchers.Worksite.Delete),
+		ValidateRefsOnDestroy:    data.ValidateRefsOnDestroy.ValueBool() || strictRefs,
+		StrictRefsOnDestroy:      strictRefs,
 	}
 
 	// Make the provider data available to resources and data sources
@@ -226,6 +249,7 @@ func (p *GuardicoreProvider) DataSources(ctx context.Context) []func() datasourc
 		NewWorksiteDataSource,
 		NewUserGroupDataSource,
 		NewAssetDataSource,
+		NewAgentAggregatorDataSource,
 	}
 }
 

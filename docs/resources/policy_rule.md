@@ -7,6 +7,7 @@ description: |-
   Use `raw_spec_json` only for unsupported top-level extras that do not yet have a typed Terraform attribute. The full API response is exposed as `raw_json`.
   The API may represent worksite assignment inside policy rule attributes, but Terraform manages it as the top-level `worksite_id` attribute.
   The `icmp_matches.version` field is treated as a pass-through string so environments can keep using the representation their API returns.
+  Each `icmp_matches[*].icmp_codes` value is always imported and sent to the API; when omitted, the provider defaults it to an empty list.
   
   Example:
   
@@ -34,6 +35,7 @@ Manages a policy rule in Akamai Guardicore Segmentation. This resource exposes t
 	Use `raw_spec_json` only for unsupported top-level extras that do not yet have a typed Terraform attribute. The full API response is exposed as `raw_json`.
 	The API may represent worksite assignment inside policy rule attributes, but Terraform manages it as the top-level `worksite_id` attribute.
 	The `icmp_matches.version` field is treated as a pass-through string so environments can keep using the representation their API returns.
+	Each `icmp_matches[*].icmp_codes` value is always imported and sent to the API; when omitted, the provider defaults it to an empty list.
 
 Example:
 
@@ -292,7 +294,9 @@ Optional:
 
 Optional:
 
-- `names` (List of String)
+- `allowed_image_names` (List of String)
+- `display_name` (String)
+- `service_name` (String)
 
 
 
@@ -370,4 +374,6 @@ Optional:
 
 Optional:
 
-- `names` (List of String)
+- `allowed_image_names` (List of String)
+- `display_name` (String)
+- `service_name` (String)

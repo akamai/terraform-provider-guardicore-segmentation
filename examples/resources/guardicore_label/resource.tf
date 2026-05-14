@@ -54,6 +54,36 @@ resource "guardicore_label" "linux_servers" {
   ]
 }
 
+# Compound criteria define a top-level OR branch with inner AND matching.
+# Subsequent criteria updates are applied by the provider via
+# /api/v3.0/visibility/labels/{id}/dynamic-criteria/changes.
+resource "guardicore_label" "containerized_prod" {
+  key   = "Runtime"
+  value = "ContainerizedProd"
+
+  criteria = [
+    {
+      field    = "name"
+      op       = "STARTSWITH"
+      argument = "prod-"
+    },
+    {
+      compound_criteria = [
+        {
+          field    = "container_labels"
+          op       = "STARTSWITH"
+          argument = "env=prod"
+        },
+        {
+          field    = "image_name"
+          op       = "CONTAINS"
+          argument = "service"
+        },
+      ]
+    },
+  ]
+}
+
 resource "guardicore_label" "dmz_assets" {
   key   = "Network Zone"
   value = "DMZ"
@@ -71,3 +101,13 @@ resource "guardicore_label" "dmz_assets" {
     },
   ]
 }
+
+# System-managed labels (e.g., platform-created labels) cannot be modified
+# by Terraform. Use the data source to reference them:
+#
+#   data "guardicore_label" "agent_installed" {
+#     key   = "Agent"
+#     value = "Installed"
+#   }
+#
+# Then reference it as: data.guardicore_label.agent_installed.id

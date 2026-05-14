@@ -18,3 +18,12 @@ resource "guardicore_user_group" "platform_engineers" {
     },
   ]
 }
+
+# System-managed user groups (local system groups) cannot be modified by
+# Terraform. Use the data source to reference them:
+#
+#   data "guardicore_user_group" "local_admins" {
+#     title = "Local Administrators"
+#   }
+#
+# Then reference it as: data.guardicore_user_group.local_admins.id

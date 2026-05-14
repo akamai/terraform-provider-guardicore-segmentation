@@ -8,7 +8,6 @@ resource "guardicore_asset" "database_primary" {
   worksite_id          = guardicore_worksite.headquarters.id
   instance_id          = "i-0123456789abcdef0"
   hw_uuid              = "550e8400-e29b-41d4-a716-446655440000"
-  bios_uuid            = "550e8400-e29b-41d4-a716-446655440001"
 
   nics = [
     {
@@ -46,10 +45,13 @@ resource "guardicore_asset" "database_primary" {
     },
   ]
 
-  orchestration_metadata_json = jsonencode({
-    asset_type         = "Database"
+  orchestration_metadata = {
+    asset_type         = "F5"
     f5_device_hostname = "db-primary-f5.example.com"
-    partition          = "Common"
+    partition          = "/Common"
     vs_name            = "db-primary-vs"
-  })
+    extra_json = jsonencode({
+      service_tier = "gold"
+    })
+  }
 }

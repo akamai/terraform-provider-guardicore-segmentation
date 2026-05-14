@@ -2,6 +2,12 @@ package importer
 
 import "text/template"
 
+var labelDataTemplate = template.Must(template.New("label_data").Parse(`data "guardicore_label" "{{.Name}}" {
+  key   = "{{.Key}}"
+  value = "{{.Value}}"
+}
+`))
+
 var labelTemplate = template.Must(template.New("label").Parse(`resource "guardicore_label" "{{.Name}}" {
   key   = "{{.Key}}"
   value = "{{.Value}}"
@@ -10,9 +16,21 @@ var labelTemplate = template.Must(template.New("label").Parse(`resource "guardic
   criteria = [
 {{- range $i, $c := .Criteria}}
     {
+{{- if $c.IsCompound}}
+      compound_criteria = [
+{{- range $j, $cc := $c.CompoundCriteria}}
+        {
+          field    = "{{$cc.Field}}"
+          op       = "{{$cc.Op}}"
+          argument = "{{$cc.Argument}}"
+        },
+{{- end}}
+      ]
+{{- else}}
       field    = "{{$c.Field}}"
       op       = "{{$c.Op}}"
       argument = "{{$c.Argument}}"
+{{- end}}
     },
 {{- end}}
   ]
@@ -70,6 +88,14 @@ type LabelTemplateData struct {
 
 // CriteriaData holds data for rendering a criteria block.
 type CriteriaData struct {
+	Field            string
+	Op               string
+	Argument         string
+	IsCompound       bool
+	CompoundCriteria []CompoundCriteriaData
+}
+
+type CompoundCriteriaData struct {
 	Field    string
 	Op       string
 	Argument string
@@ -109,6 +135,11 @@ var dnsSecurityTemplate = template.Must(template.New("dns_security").Parse(`reso
 
 import {
   to = guardicore_dns_security.{{.Name}}
+  id = "{{.ID}}"
+}
+`))
+
+var dnsSecurityDataTemplate = template.Must(template.New("dns_security_data").Parse(`data "guardicore_dns_security" "{{.Name}}" {
   id = "{{.ID}}"
 }
 `))
@@ -154,10 +185,15 @@ type IncidentTemplateData struct {
 	CommentedAffectedAssetsJSON string
 }
 
+var worksiteDataTemplate = template.Must(template.New("worksite_data").Parse(`data "guardicore_worksite" "{{.Name}}" {
+  name = {{.ResourceNameHCL}}
+}
+`))
+
 var worksiteTemplate = template.Must(template.New("worksite").Parse(`resource "guardicore_worksite" "{{.Name}}" {
-  name = "{{.ResourceName}}"
-{{- if .Comment}}
-  comment = "{{.Comment}}"
+  name = {{.ResourceNameHCL}}
+{{- if .CommentHCL}}
+  comment = {{.CommentHCL}}
 {{- end}}
 }
 
@@ -169,10 +205,10 @@ import {
 
 // WorksiteTemplateData holds data for rendering a worksite resource block.
 type WorksiteTemplateData struct {
-	Name         string
-	ID           string
-	ResourceName string
-	Comment      string
+	Name            string
+	ID              string
+	ResourceNameHCL string
+	CommentHCL      string
 }
 
 var userGroupTemplate = template.Must(template.New("user_group").Parse(`resource "guardicore_user_group" "{{.Name}}" {
@@ -191,6 +227,11 @@ var userGroupTemplate = template.Must(template.New("user_group").Parse(`resource
 import {
   to = guardicore_user_group.{{.Name}}
   id = "{{.ID}}"
+}
+`))
+
+var userGroupDataTemplate = template.Must(template.New("user_group_data").Parse(`data "guardicore_user_group" "{{.Name}}" {
+  title = "{{.Title}}"
 }
 `))
 
@@ -219,9 +260,6 @@ var assetTemplate = template.Must(template.New("asset").Parse(`resource "guardic
 {{- end}}
 {{- if .HwUUID}}
   hw_uuid              = "{{.HwUUID}}"
-{{- end}}
-{{- if .BiosUUID}}
-  bios_uuid            = "{{.BiosUUID}}"
 {{- end}}
 {{- if .Comments}}
   comments = "{{.Comments}}"
@@ -269,6 +307,15 @@ import {
 }
 `))
 
+var assetSkippedTemplate = template.Must(template.New("asset_skipped").Parse(`# NOTE: Asset "{{.ResourceName}}" has no valid NICs and cannot be managed by Terraform.
+# The guardicore_asset resource requires at least one NIC with at least one ip_address.
+# Agent-reported assets may have NICs with empty ip_addresses that the provider filters out.
+# resource "guardicore_asset" "{{.Name}}" {
+#   name                 = "{{.ResourceName}}"
+#   orchestration_obj_id = "{{.OrchestrationObjID}}"
+# }
+`))
+
 // AssetTemplateData holds data for rendering an asset resource block.
 type AssetTemplateData struct {
 	Name               string
@@ -278,7 +325,6 @@ type AssetTemplateData struct {
 	OrchObjIDComment   string
 	InstanceID         string
 	HwUUID             string
-	BiosUUID           string
 	Comments           string
 	Status             string
 	Labels             []AssetLabelRefData
@@ -299,4 +345,17 @@ type AssetNICData struct {
 	MacAddress  string
 	VifID       string
 	NetworkName string
+}
+
+// Agent aggregator template (data source only — aggregators are system-managed)
+
+var agentAggregatorDataTemplate = template.Must(template.New("agent_aggregator_data").Parse(`data "guardicore_agent_aggregator" "{{.Name}}" {
+  hostname = "{{.Hostname}}"
+}
+`))
+
+// AgentAggregatorTemplateData holds data for rendering an agent aggregator data source block.
+type AgentAggregatorTemplateData struct {
+	Name     string
+	Hostname string
 }

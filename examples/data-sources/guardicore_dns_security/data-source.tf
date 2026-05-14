@@ -9,6 +9,12 @@ data "guardicore_dns_security" "malware_list" {
   name = "Known Malware Domains"
 }
 
+# System-managed DNS blocklist types (for example, AKAMAI_INTELLIGENCE and
+# WEB_CATEGORY) should be referenced via data sources.
+data "guardicore_dns_security" "akamai_intelligence" {
+  name = "Akamai Intelligence Feed"
+}
+
 output "dns_security_details" {
   value = {
     id      = data.guardicore_dns_security.malware_list.id

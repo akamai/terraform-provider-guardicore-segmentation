@@ -28,6 +28,8 @@ type UserGroupDataSourceModel struct {
 	ID                   types.String              `tfsdk:"id"`
 	Title                types.String              `tfsdk:"title"`
 	OrchestrationsGroups []OrchestrationGroupModel `tfsdk:"orchestrations_groups"`
+	SystemManaged        types.Bool                `tfsdk:"system_managed"`
+	ManagedBy            types.String              `tfsdk:"managed_by"`
 }
 
 func (d *UserGroupDataSource) Metadata(ctx context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -36,7 +38,9 @@ func (d *UserGroupDataSource) Metadata(ctx context.Context, req datasource.Metad
 
 func (d *UserGroupDataSource) Schema(ctx context.Context, req datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Retrieves information about a user group from Akamai Guardicore Segmentation. You can look up a user group by its ID or by title.",
+		MarkdownDescription: "Reads a user group from Akamai Guardicore Segmentation.\n\n" +
+			"Use this data source to reference existing user groups, including system-managed groups that cannot be modified by Terraform. " +
+			"The `system_managed` attribute indicates whether the group is managed by the platform.",
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -65,6 +69,14 @@ func (d *UserGroupDataSource) Schema(ctx context.Context, req datasource.SchemaR
 						},
 					},
 				},
+			},
+			"system_managed": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether this user group is system-managed. System-managed groups cannot be updated or deleted by Terraform. Use the `guardicore_user_group` data source to reference them.",
+			},
+			"managed_by": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Identifies who manages this user group. `terraform` for user-managed groups, or `system` for platform-managed groups.",
 			},
 		},
 	}
@@ -145,17 +157,11 @@ func (d *UserGroupDataSource) Read(ctx context.Context, req datasource.ReadReque
 	// Map API response to model
 	data.ID = types.StringValue(userGroup.ID)
 	data.Title = types.StringValue(userGroup.Title)
+	data.OrchestrationsGroups = resolveOrchestrationGroups(ctx, userGroup, &resp.Diagnostics)
 
-	orchGroups := make([]OrchestrationGroupModel, len(userGroup.OrchestrationsGroups))
-	for i, og := range userGroup.OrchestrationsGroups {
-		groupsList, diags := types.ListValueFrom(ctx, types.StringType, og.Groups)
-		resp.Diagnostics.Append(diags...)
-		orchGroups[i] = OrchestrationGroupModel{
-			OrchestrationID: types.StringValue(og.OrchestrationID),
-			Groups:          groupsList,
-		}
-	}
-	data.OrchestrationsGroups = orchGroups
+	sm, mb := UserGroupIsSystemManaged(userGroup)
+	data.SystemManaged = types.BoolValue(sm)
+	data.ManagedBy = types.StringValue(mb)
 
 	tflog.Trace(ctx, "read user group data source", map[string]any{"id": userGroup.ID})
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,24 +184,28 @@ func TestNewClient_NoAuthMethod(t *testing.T) {
 
 func TestClient_CreateLabel(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v4.0/labels" {
-			t.Errorf("expected path '/api/v4.0/labels', got '%s'", r.URL.Path)
+		if r.URL.Path != "/api/v4.0/labels/bulk" {
+			t.Errorf("expected path '/api/v4.0/labels/bulk', got '%s'", r.URL.Path)
 		}
 		if r.Method != http.MethodPost {
 			t.Errorf("expected method POST, got '%s'", r.Method)
 		}
 
-		var label LabelCreate
-		if err := json.NewDecoder(r.Body).Decode(&label); err != nil {
+		var labels []LabelCreate
+		if err := json.NewDecoder(r.Body).Decode(&labels); err != nil {
 			t.Fatalf("failed to decode request body: %v", err)
 		}
 
-		if label.Key != "Environment" || label.Value != "Production" {
-			t.Errorf("unexpected label data: %+v", label)
+		if len(labels) != 1 {
+			t.Fatalf("expected 1 label in bulk request, got %d", len(labels))
+		}
+
+		if labels[0].Key != "Environment" || labels[0].Value != "Production" {
+			t.Errorf("unexpected label data: %+v", labels[0])
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(t, w, CreateResponse{ID: "label-123"})
+		writeJSON(t, w, LabelBulkResponse{Succeeded: []string{"label-123"}})
 	}))
 	defer server.Close()
 
@@ -298,7 +303,14 @@ func TestClient_UpdateLabel(t *testing.T) {
 			t.Errorf("expected method PUT, got '%s'", r.Method)
 		}
 
-		w.Header().Set("Content-Type", "application/json")
+		var label LabelUpdate
+		if err := json.NewDecoder(r.Body).Decode(&label); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		if label.Key != "Environment" {
+			t.Errorf("expected Key 'Environment', got '%s'", label.Key)
+		}
+
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -324,16 +336,501 @@ func TestClient_UpdateLabel(t *testing.T) {
 	}
 }
 
-func TestClient_DeleteLabel(t *testing.T) {
+func TestClient_UpdateLabel_DynamicCriteriaAddSingle(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+	seenChanges := false
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v4.0/labels/label-123" {
-			t.Errorf("expected path '/api/v4.0/labels/label-123', got '%s'", r.URL.Path)
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-123", Key: "Environment", Value: "Production", DynamicCriteria: []LabelCriteria{}}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			seenChanges = true
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			var req LabelUpdate
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode label update: %v", err)
+			}
+			if req.Key != "Environment" || req.Value != "Staging" {
+				t.Fatalf("unexpected update payload: %+v", req)
+			}
+			if req.Criteria != nil {
+				t.Fatalf("expected generic update endpoint without criteria, got %+v", req.Criteria)
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 		}
-		if r.Method != http.MethodDelete {
-			t.Errorf("expected method DELETE, got '%s'", r.Method)
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{
+		Key:   "Environment",
+		Value: "Staging",
+		Criteria: []LabelCriteria{
+			{Field: "name", Op: "STARTSWITH", Argument: "web"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if !seenChanges {
+		t.Fatal("expected dynamic criteria changes call")
+	}
+	if len(gotChanges.Added) != 1 || len(gotChanges.Modified) != 0 || len(gotChanges.Deleted) != 0 {
+		t.Fatalf("unexpected changes payload: %+v", gotChanges)
+	}
+	if gotChanges.Added[0].Source != "User" {
+		t.Fatalf("expected source User, got %q", gotChanges.Added[0].Source)
+	}
+	if gotChanges.Added[0].Field != "name" || gotChanges.Added[0].Op != "STARTSWITH" || gotChanges.Added[0].Argument != "web" {
+		t.Fatalf("unexpected added criterion: %+v", gotChanges.Added[0])
+	}
+	if matched, _ := regexp.MatchString(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, gotChanges.Added[0].ID); !matched {
+		t.Fatalf("expected generated UUID id, got %q", gotChanges.Added[0].ID)
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaAddCompound(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-123", Key: "Environment", Value: "Production"}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{
+		Key:   "Environment",
+		Value: "Staging",
+		Criteria: []LabelCriteria{
+			{CompoundCriteria: []LabelCriteria{{Field: "container_labels", Op: "STARTSWITH", Argument: "prod"}, {Field: "image_name", Op: "CONTAINS", Argument: "nginx"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Added) != 1 || len(gotChanges.Added[0].CompoundCriteria) != 2 {
+		t.Fatalf("unexpected compound add payload: %+v", gotChanges)
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaModifySingle(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-123", Key: "Environment", Value: "Production", DynamicCriteria: []LabelCriteria{{ID: "crit-1", Field: "name", Op: "STARTSWITH", Argument: "old"}}}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{Key: "Environment", Value: "Staging", Criteria: []LabelCriteria{{Field: "name", Op: "STARTSWITH", Argument: "new"}}})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Modified) != 1 || gotChanges.Modified[0].ID != "crit-1" {
+		t.Fatalf("expected one modify on crit-1, got %+v", gotChanges)
+	}
+	if len(gotChanges.Added) != 0 || len(gotChanges.Deleted) != 0 {
+		t.Fatalf("expected modify-only payload, got %+v", gotChanges)
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaModifyCompoundReplaceArray(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{
+				ID:              "label-123",
+				Key:             "Environment",
+				Value:           "Production",
+				DynamicCriteria: []LabelCriteria{{ID: "crit-comp", CompoundCriteria: []LabelCriteria{{Field: "container_labels", Op: "STARTSWITH", Argument: "old"}, {Field: "image_name", Op: "CONTAINS", Argument: "old-image"}}}},
+			}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{
+		Key:   "Environment",
+		Value: "Staging",
+		Criteria: []LabelCriteria{{
+			CompoundCriteria: []LabelCriteria{{Field: "container_labels", Op: "STARTSWITH", Argument: "new"}, {Field: "container_command", Op: "CONTAINS", Argument: "run"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Modified) != 1 || gotChanges.Modified[0].ID != "crit-comp" {
+		t.Fatalf("expected compound modify with existing id, got %+v", gotChanges)
+	}
+	if len(gotChanges.Modified[0].CompoundCriteria) != 2 {
+		t.Fatalf("expected full compound replacement, got %+v", gotChanges.Modified[0])
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaDeleteSingle(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-123", Key: "Environment", Value: "Production", DynamicCriteria: []LabelCriteria{{ID: "crit-delete", Field: "name", Op: "CONTAINS", Argument: "x"}}}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{Key: "Environment", Value: "Staging", Criteria: []LabelCriteria{}})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Deleted) != 1 || gotChanges.Deleted[0] != "crit-delete" {
+		t.Fatalf("expected delete crit-delete, got %+v", gotChanges)
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaDeleteCompound(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-123", Key: "Environment", Value: "Production", DynamicCriteria: []LabelCriteria{{ID: "crit-comp-del", CompoundCriteria: []LabelCriteria{{Field: "image_name", Op: "CONTAINS", Argument: "nginx"}}}}}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{Key: "Environment", Value: "Staging", Criteria: []LabelCriteria{}})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Deleted) != 1 || gotChanges.Deleted[0] != "crit-comp-del" {
+		t.Fatalf("expected delete crit-comp-del, got %+v", gotChanges)
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaMixedAddModifyDelete(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{
+				ID:    "label-123",
+				Key:   "Environment",
+				Value: "Production",
+				DynamicCriteria: []LabelCriteria{
+					{ID: "crit-mod", Field: "name", Op: "STARTSWITH", Argument: "old"},
+					{ID: "crit-del", Field: "name", Op: "CONTAINS", Argument: "to-delete"},
+					{ID: "crit-keep", Field: "name", Op: "EQUALS", Argument: "keep"},
+				},
+			}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{
+		Key:   "Environment",
+		Value: "Staging",
+		Criteria: []LabelCriteria{
+			{Field: "name", Op: "STARTSWITH", Argument: "new"},
+			{Field: "name", Op: "EQUALS", Argument: "keep"},
+			{Field: "name", Op: "ENDSWITH", Argument: "added"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(gotChanges.Added) != 1 || len(gotChanges.Modified) != 1 || len(gotChanges.Deleted) != 1 {
+		t.Fatalf("expected add+modify+delete, got %+v", gotChanges)
+	}
+	if gotChanges.Modified[0].ID != "crit-mod" {
+		t.Fatalf("expected modify id crit-mod, got %+v", gotChanges.Modified)
+	}
+	if gotChanges.Deleted[0] != "crit-del" {
+		t.Fatalf("expected delete id crit-del, got %+v", gotChanges.Deleted)
+	}
+}
+
+func TestClient_UpdateLabelDynamicCriteriaChanges_UnknownModifiedOrDeletedID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"description":"criterion id not found","error_code":"IllegalValue"}`)
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	err := c.UpdateLabelDynamicCriteriaChanges(context.Background(), "label-123", &LabelDynamicCriteriaChangesRequest{
+		Added:    []LabelDynamicCriterionChange{},
+		Modified: []LabelDynamicCriterionChange{{ID: "missing", Source: "User", Field: "name", Op: "EQUALS", Argument: "x"}},
+		Deleted:  []string{"missing-delete"},
+	})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+}
+
+func TestClient_UpdateLabelDynamicCriteriaChanges_RejectsMalformedCriteria(t *testing.T) {
+	c := &Client{config: Config{BaseURL: "https://example.invalid"}, httpClient: http.DefaultClient, token: "test-token"}
+	err := c.UpdateLabelDynamicCriteriaChanges(context.Background(), "label-123", &LabelDynamicCriteriaChangesRequest{
+		Added: []LabelDynamicCriterionChange{{
+			ID:               "id-1",
+			Source:           "User",
+			Field:            "name",
+			Op:               "EQUALS",
+			Argument:         "x",
+			CompoundCriteria: []LabelDynamicCompoundCriterion{{Field: "container_labels", Op: "STARTSWITH", Argument: "prod"}},
+		}},
+		Modified: []LabelDynamicCriterionChange{},
+		Deleted:  []string{},
+	})
+	if err == nil {
+		t.Fatal("expected malformed criterion error")
+	}
+	if !strings.Contains(err.Error(), "cannot set both") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestClient_UpdateLabelDynamicCriteriaChanges_CompoundDoesNotRequireInnerIDs(t *testing.T) {
+	seen := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
 		}
 
-		w.WriteHeader(http.StatusNoContent)
+		var raw map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatalf("decode raw: %v", err)
+		}
+
+		added, ok := raw["added"].([]any)
+		if !ok || len(added) != 1 {
+			t.Fatalf("expected one added, got %+v", raw)
+		}
+		entry, ok := added[0].(map[string]any)
+		if !ok {
+			t.Fatalf("unexpected added entry: %#v", added[0])
+		}
+		compound, ok := entry["compound_criteria"].([]any)
+		if !ok || len(compound) != 1 {
+			t.Fatalf("expected one compound row, got %+v", entry)
+		}
+		inner, ok := compound[0].(map[string]any)
+		if !ok {
+			t.Fatalf("unexpected inner row: %#v", compound[0])
+		}
+		if _, exists := inner["id"]; exists {
+			t.Fatalf("compound inner rows must not include id: %+v", inner)
+		}
+
+		seen = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	err := c.UpdateLabelDynamicCriteriaChanges(context.Background(), "label-123", &LabelDynamicCriteriaChangesRequest{
+		Added: []LabelDynamicCriterionChange{{
+			ID:     "crit-1",
+			Source: "User",
+			CompoundCriteria: []LabelDynamicCompoundCriterion{{
+				Field:    "container_labels",
+				Op:       "STARTSWITH",
+				Argument: "prod",
+			}},
+		}},
+		Modified: []LabelDynamicCriterionChange{},
+		Deleted:  []string{},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !seen {
+		t.Fatal("expected endpoint call")
+	}
+}
+
+func TestClient_UpdateLabel_DynamicCriteriaCounterMatchesRequestSize(t *testing.T) {
+	var gotChanges LabelDynamicCriteriaChangesRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{
+				ID:              "label-123",
+				Key:             "Environment",
+				Value:           "Production",
+				DynamicCriteria: []LabelCriteria{{ID: "keep-1", Field: "name", Op: "EQUALS", Argument: "keep"}, {ID: "del-1", Field: "name", Op: "EQUALS", Argument: "del"}},
+			}}})
+		case r.URL.Path == "/api/v3.0/visibility/labels/label-123/dynamic-criteria/changes" && r.Method == http.MethodPost:
+			if err := json.NewDecoder(r.Body).Decode(&gotChanges); err != nil {
+				t.Fatalf("decode changes: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	desired := []LabelCriteria{{Field: "name", Op: "EQUALS", Argument: "keep"}, {Field: "name", Op: "STARTSWITH", Argument: "new-a"}, {Field: "name", Op: "ENDSWITH", Argument: "new-b"}}
+	_, err := c.UpdateLabel(context.Background(), "label-123", &LabelUpdate{Key: "Environment", Value: "Staging", Criteria: desired})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	currentCount := 2
+	computed := currentCount + len(gotChanges.Added) - len(gotChanges.Deleted)
+	if computed != len(desired) {
+		t.Fatalf("expected computed dynamic criteria count %d, got %d (changes=%+v)", len(desired), computed, gotChanges)
+	}
+}
+
+func TestClient_CreateLabel_WithInitialDynamicCriteria(t *testing.T) {
+	seenCriteria := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v4.0/labels/bulk" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+
+		var labels []LabelCreate
+		if err := json.NewDecoder(r.Body).Decode(&labels); err != nil {
+			t.Fatalf("decode labels: %v", err)
+		}
+		if len(labels) != 1 {
+			t.Fatalf("expected 1 label, got %d", len(labels))
+		}
+		if len(labels[0].Criteria) != 2 {
+			t.Fatalf("expected 2 initial criteria, got %+v", labels[0].Criteria)
+		}
+		seenCriteria = true
+		writeJSON(t, w, LabelBulkResponse{Succeeded: []string{"label-123"}})
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+	_, err := c.CreateLabel(context.Background(), &LabelCreate{
+		Key:   "Environment",
+		Value: "Production",
+		Criteria: []LabelCriteria{
+			{Field: "name", Op: "STARTSWITH", Argument: "web"},
+			{CompoundCriteria: []LabelCriteria{{Field: "container_labels", Op: "CONTAINS", Argument: "prod"}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if !seenCriteria {
+		t.Fatal("expected create payload to include initial criteria")
+	}
+}
+
+func TestClient_DeleteLabel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v4.0/labels/bulk_delete" && r.Method == http.MethodDelete:
+			var items []LabelBulkDeleteItem
+			if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+				t.Fatalf("failed to decode request body: %v", err)
+			}
+			if len(items) != 1 || items[0].ID != "label-123" {
+				t.Fatalf("unexpected bulk delete body: %+v", items)
+			}
+			writeJSON(t, w, LabelBulkResponse{Succeeded: []string{"label-123"}})
+		case r.URL.Path == "/api/v4.0/labels/label-123" && r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer server.Close()
 
@@ -2057,91 +2554,6 @@ func TestClient_BulkCreateIncidents(t *testing.T) {
 	}
 }
 
-func TestClient_CreateAsset(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v4.0/assets/" {
-			t.Errorf("expected path '/api/v4.0/assets/', got '%s'", r.URL.Path)
-		}
-		if r.Method != http.MethodPost {
-			t.Errorf("expected method POST, got '%s'", r.Method)
-		}
-
-		var asset AssetCreate
-		if err := json.NewDecoder(r.Body).Decode(&asset); err != nil {
-			t.Fatalf("failed to decode request body: %v", err)
-		}
-
-		if asset.Name != "test-asset" {
-			t.Errorf("expected name 'test-asset', got '%s'", asset.Name)
-		}
-		if asset.OrchestrationObjID != "orch-123" {
-			t.Errorf("expected orchestration_obj_id 'orch-123', got '%s'", asset.OrchestrationObjID)
-		}
-		if len(asset.Nics) != 1 {
-			t.Fatalf("expected 1 NIC, got %d", len(asset.Nics))
-		}
-		if len(asset.Nics[0].IPAddresses) != 1 || asset.Nics[0].IPAddresses[0] != "10.0.0.1" {
-			t.Errorf("expected IP '10.0.0.1', got %v", asset.Nics[0].IPAddresses)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		// NOTE: asset create response uses asset_id, not id
-		writeJSON(t, w, CreateAssetResponse{AssetID: "asset-456"})
-	}))
-	defer server.Close()
-
-	client := &Client{
-		config:     Config{BaseURL: server.URL},
-		httpClient: http.DefaultClient,
-		token:      "test-token",
-	}
-
-	asset := &AssetCreate{
-		Name:               "test-asset",
-		OrchestrationObjID: "orch-123",
-		Nics: []AssetNIC{
-			{IPAddresses: []string{"10.0.0.1"}},
-		},
-	}
-
-	id, err := client.CreateAsset(context.Background(), asset)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-
-	if id != "asset-456" {
-		t.Errorf("expected ID 'asset-456', got '%s'", id)
-	}
-}
-
-func TestClient_CreateAsset_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"error":"validation failed"}`)
-	}))
-	defer server.Close()
-
-	client := &Client{
-		config:     Config{BaseURL: server.URL},
-		httpClient: http.DefaultClient,
-		token:      "test-token",
-	}
-
-	asset := &AssetCreate{
-		Name:               "test-asset",
-		OrchestrationObjID: "orch-123",
-		Nics:               []AssetNIC{{IPAddresses: []string{"10.0.0.1"}}},
-	}
-
-	_, err := client.CreateAsset(context.Background(), asset)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to create asset") {
-		t.Errorf("expected 'failed to create asset' error, got: %v", err)
-	}
-}
-
 func TestClient_GetAsset(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v4.0/assets" {
@@ -2155,6 +2567,9 @@ func TestClient_GetAsset(t *testing.T) {
 		}
 		if r.URL.Query().Get("max_results") != "1" {
 			t.Errorf("expected max_results query param '1', got '%s'", r.URL.Query().Get("max_results"))
+		}
+		if r.URL.Query().Get("expand") != "labels" {
+			t.Errorf("expected expand query param 'labels', got '%s'", r.URL.Query().Get("expand"))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -2251,70 +2666,6 @@ func TestClient_GetAsset_Error(t *testing.T) {
 	}
 }
 
-func TestClient_UpdateAsset(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v4.0/assets/asset-456" {
-			t.Errorf("expected path '/api/v4.0/assets/asset-456', got '%s'", r.URL.Path)
-		}
-		if r.Method != http.MethodPut {
-			t.Errorf("expected method PUT, got '%s'", r.Method)
-		}
-
-		var update AssetUpdate
-		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
-			t.Fatalf("failed to decode request body: %v", err)
-		}
-
-		if update.Name != "updated-asset" {
-			t.Errorf("expected name 'updated-asset', got '%s'", update.Name)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client := &Client{
-		config:     Config{BaseURL: server.URL},
-		httpClient: http.DefaultClient,
-		token:      "test-token",
-	}
-
-	update := &AssetUpdate{
-		Name: "updated-asset",
-		Nics: []AssetNIC{
-			{IPAddresses: []string{"10.0.0.2"}},
-		},
-	}
-
-	err := client.UpdateAsset(context.Background(), "asset-456", update)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-}
-
-func TestClient_UpdateAsset_Error(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"error":"validation failed"}`)
-	}))
-	defer server.Close()
-
-	client := &Client{
-		config:     Config{BaseURL: server.URL},
-		httpClient: http.DefaultClient,
-		token:      "test-token",
-	}
-
-	err := client.UpdateAsset(context.Background(), "asset-456", &AssetUpdate{Name: "bad"})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to update asset") {
-		t.Errorf("expected 'failed to update asset' error, got: %v", err)
-	}
-}
-
 func TestClient_DeleteAsset(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v4.0/assets/asset-456" {
@@ -2396,6 +2747,9 @@ func TestClient_ListAssets(t *testing.T) {
 		if r.URL.Query().Get("max_results") == "" {
 			t.Error("expected max_results query parameter")
 		}
+		if r.URL.Query().Get("expand") != "labels" {
+			t.Errorf("expected expand query parameter 'labels', got '%s'", r.URL.Query().Get("expand"))
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		writeJSON(t, w, ListAssetsResponse{
@@ -2435,6 +2789,9 @@ func TestClient_ListAssets_WithNameFilter(t *testing.T) {
 		nameFilter := r.URL.Query().Get("name")
 		if nameFilter != "web-server" {
 			t.Errorf("expected name filter 'web-server', got '%s'", nameFilter)
+		}
+		if r.URL.Query().Get("expand") != "labels" {
+			t.Errorf("expected expand query parameter 'labels', got '%s'", r.URL.Query().Get("expand"))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -2563,6 +2920,44 @@ func TestClient_ListAssets_PaginationSafetyLimit(t *testing.T) {
 	}
 }
 
+func TestClient_ListAssets_TotalFieldName(t *testing.T) {
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+
+		if callCount == 1 {
+			// Simulate real API: uses "total" not "total_count"
+			fmt.Fprint(w, `{"objects":[{"id":"a1","name":"first"},{"id":"a2","name":"second"}],"total":3}`)
+		} else {
+			fmt.Fprint(w, `{"objects":[{"id":"a3","name":"third"}],"total":3}`)
+		}
+	}))
+	defer server.Close()
+
+	origPageSize := defaultPageSize
+	defaultPageSize = 2
+	defer func() { defaultPageSize = origPageSize }()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	assets, err := client.ListAssets(context.Background(), "")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(assets) != 3 {
+		t.Fatalf("expected 3 assets (pagination across 2 pages), got %d — 'total' field may not be parsed correctly", len(assets))
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 API calls, got %d", callCount)
+	}
+}
+
 func TestClient_BulkCreateAssets(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v4.0/assets/bulk" {
@@ -2583,7 +2978,12 @@ func TestClient_BulkCreateAssets(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		writeJSON(t, w, []string{"asset-1", "asset-2"})
+		writeJSON(t, w, BulkCreateAssetsResponse{
+			NumberOfSucceeded: 2,
+			NumberOfFailed:    0,
+			TotalNumber:       2,
+			CreatedAssetIDs:   map[string]string{"orch-1": "asset-1", "orch-2": "asset-2"},
+		})
 	}))
 	defer server.Close()
 
@@ -2598,16 +2998,19 @@ func TestClient_BulkCreateAssets(t *testing.T) {
 		{Name: "asset-2", OrchestrationObjID: "orch-2", Nics: []AssetNIC{{IPAddresses: []string{"10.0.0.2"}}}},
 	}
 
-	ids, err := client.BulkCreateAssets(context.Background(), assets)
+	bulkResp, err := client.BulkCreateAssets(context.Background(), assets)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if len(ids) != 2 {
-		t.Fatalf("expected 2 IDs, got %d", len(ids))
+	if bulkResp.NumberOfSucceeded != 2 {
+		t.Fatalf("expected 2 succeeded, got %d", bulkResp.NumberOfSucceeded)
 	}
-	if ids[0] != "asset-1" || ids[1] != "asset-2" {
-		t.Errorf("expected IDs ['asset-1', 'asset-2'], got %v", ids)
+	if bulkResp.CreatedAssetIDs["orch-1"] != "asset-1" {
+		t.Errorf("expected orch-1 -> asset-1, got %s", bulkResp.CreatedAssetIDs["orch-1"])
+	}
+	if bulkResp.CreatedAssetIDs["orch-2"] != "asset-2" {
+		t.Errorf("expected orch-2 -> asset-2, got %s", bulkResp.CreatedAssetIDs["orch-2"])
 	}
 }
 
@@ -2654,7 +3057,12 @@ func TestClient_BulkUpdateAssets(t *testing.T) {
 			t.Errorf("expected first asset_id 'asset-1', got '%s'", items[0].AssetID)
 		}
 
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, BulkUpdateAssetsResponse{
+			NumberOfSucceeded: 2,
+			NumberOfFailed:    0,
+			TotalNumber:       2,
+		})
 	}))
 	defer server.Close()
 
@@ -2669,8 +3077,63 @@ func TestClient_BulkUpdateAssets(t *testing.T) {
 		{AssetID: "asset-2", Name: "updated-2"},
 	}
 
-	err := client.BulkUpdateAssets(context.Background(), items)
+	bulkResp, err := client.BulkUpdateAssets(context.Background(), items)
 	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if bulkResp.NumberOfSucceeded != 2 {
+		t.Fatalf("expected 2 succeeded, got %d", bulkResp.NumberOfSucceeded)
+	}
+}
+
+func TestClient_BulkUpdateAssets_LabelsNilOmittedAndEmptyIncluded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v4.0/assets/bulk" {
+			t.Errorf("expected path '/api/v4.0/assets/bulk', got '%s'", r.URL.Path)
+		}
+		if r.Method != http.MethodPut {
+			t.Errorf("expected method PUT, got '%s'", r.Method)
+		}
+
+		var raw []map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatalf("failed to decode raw request body: %v", err)
+		}
+		if len(raw) != 2 {
+			t.Fatalf("expected 2 items, got %d", len(raw))
+		}
+
+		if _, ok := raw[0]["labels"]; ok {
+			t.Fatalf("expected labels field omitted when labels pointer is nil")
+		}
+
+		labelsVal, ok := raw[1]["labels"]
+		if !ok {
+			t.Fatalf("expected labels field present for explicit empty labels")
+		}
+		labelsArr, ok := labelsVal.([]interface{})
+		if !ok {
+			t.Fatalf("expected labels to be an array, got %T", labelsVal)
+		}
+		if len(labelsArr) != 0 {
+			t.Fatalf("expected explicit empty labels array, got len=%d", len(labelsArr))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, BulkUpdateAssetsResponse{NumberOfSucceeded: 2, NumberOfFailed: 0, TotalNumber: 2})
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+
+	emptyLabels := []AssetLabelRef{}
+	items := []AssetBulkUpdateItem{
+		{AssetID: "asset-1", Name: "n1", Labels: nil},
+		{AssetID: "asset-2", Name: "n2", Labels: &emptyLabels},
+	}
+
+	if _, err := c.BulkUpdateAssets(context.Background(), items); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
@@ -2688,7 +3151,7 @@ func TestClient_BulkUpdateAssets_Error(t *testing.T) {
 		token:      "test-token",
 	}
 
-	err := client.BulkUpdateAssets(context.Background(), []AssetBulkUpdateItem{})
+	_, err := client.BulkUpdateAssets(context.Background(), []AssetBulkUpdateItem{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -2760,6 +3223,49 @@ func TestClient_BulkDeactivateAssets_Error(t *testing.T) {
 }
 
 // isWorksiteFeatureDisabled tests
+
+func TestIsDnsSecurityFeatureDisabled(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		expected   bool
+	}{
+		{
+			name:       "403 with DNS feature disabled API error",
+			statusCode: http.StatusForbidden,
+			body:       `{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`,
+			expected:   true,
+		},
+		{
+			name:       "403 with string fallback match",
+			statusCode: http.StatusForbidden,
+			body:       `{"error":"DNS Security is not enabled"}`,
+			expected:   true,
+		},
+		{
+			name:       "403 with unrelated error",
+			statusCode: http.StatusForbidden,
+			body:       `{"error_code":"OperationFailed","error_dump":"something else"}`,
+			expected:   false,
+		},
+		{
+			name:       "400 with DNS disabled message",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`,
+			expected:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := isDnsSecurityFeatureDisabled(tc.statusCode, []byte(tc.body))
+			if result != tc.expected {
+				t.Errorf("expected %v, got %v", tc.expected, result)
+			}
+		})
+	}
+}
 
 func TestIsWorksiteFeatureDisabled(t *testing.T) {
 	tests := []struct {
@@ -3043,7 +3549,8 @@ func TestClient_DeleteWorksite(t *testing.T) {
 			t.Errorf("expected negate_args nil, got %v", req.NegateArgs)
 		}
 
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, DeleteWorksitesResponse{Successes: 1, Failures: 0, Skips: 0})
 	}))
 	defer server.Close()
 
@@ -3056,6 +3563,105 @@ func TestClient_DeleteWorksite(t *testing.T) {
 	err := client.DeleteWorksite(context.Background(), "ws-123")
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestClient_DeleteWorksite_SkippedIn200Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, DeleteWorksitesResponse{
+			AssignedDetails:   "Reassign any assigned Agent, Asset, Rule, Installation Profile, Permission Scheme or Orchestration to another Worksite and try again.",
+			AssignedWorksites: 1,
+			Details:           "Worksites: ws-123 not deleted, these worksites are assigned",
+			Failures:          0,
+			Skips:             1,
+			Successes:         0,
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.DeleteWorksite(context.Background(), "ws-123")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to delete worksite") {
+		t.Fatalf("expected delete error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "skips=1") {
+		t.Fatalf("expected skips count in error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not deleted") {
+		t.Fatalf("expected API details in error, got: %v", err)
+	}
+}
+
+func TestClient_DeleteWorksite_FailedIn200Response(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, DeleteWorksitesResponse{
+			Details:   "Worksites: ws-123 not deleted",
+			Failures:  1,
+			Skips:     0,
+			Successes: 0,
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.DeleteWorksite(context.Background(), "ws-123")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failures=1") {
+		t.Fatalf("expected failures count in error, got: %v", err)
+	}
+}
+
+func TestClient_DeleteWorksite_200ResponseZeroSkipsAndFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, DeleteWorksitesResponse{Failures: 0, Skips: 0, Successes: 1})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.DeleteWorksite(context.Background(), "ws-123")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestClient_DeleteWorksite_NoContent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.DeleteWorksite(context.Background(), "ws-123")
+	if err != nil {
+		t.Fatalf("expected no error for 204 response, got %v", err)
 	}
 }
 
@@ -3637,6 +4243,46 @@ func TestClient_CreatePolicyRevision_Error(t *testing.T) {
 	}
 }
 
+func TestClient_CreatePolicyRevision_RevisionUnchanged(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"description":"Revision hasn't been changed.","error_code":"BAD_REQUEST"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.CreatePolicyRevision(context.Background(), &PolicyRevisionRequest{})
+	if !errors.Is(err, ErrPolicyRevisionUnchanged) {
+		t.Fatalf("expected ErrPolicyRevisionUnchanged, got: %v", err)
+	}
+}
+
+func TestIsPolicyRevisionUnchanged(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       bool
+	}{
+		{"matching", http.StatusBadRequest, `{"description":"Revision hasn't been changed.","error_code":"BAD_REQUEST"}`, true},
+		{"wrong status", http.StatusInternalServerError, `{"description":"Revision hasn't been changed."}`, false},
+		{"different error", http.StatusBadRequest, `{"description":"Something else went wrong."}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isPolicyRevisionUnchanged(tt.statusCode, []byte(tt.body))
+			if got != tt.want {
+				t.Errorf("isPolicyRevisionUnchanged(%d, %q) = %v, want %v", tt.statusCode, tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 // Error path tests for existing functions
 
 func TestClient_CreateLabel_Error(t *testing.T) {
@@ -3867,6 +4513,144 @@ func TestClient_BulkCreatePolicyRules_Error(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to bulk create policy rules") {
 		t.Errorf("expected 'failed to bulk create policy rules' error, got: %v", err)
+	}
+}
+
+func TestClient_BulkUpdatePolicyRules(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v4.0/visibility/policy/rules/bulk" {
+			t.Errorf("expected path '/api/v4.0/visibility/policy/rules/bulk', got '%s'", r.URL.Path)
+		}
+		if r.Method != http.MethodPut {
+			t.Errorf("expected method PUT, got '%s'", r.Method)
+		}
+
+		var body []PolicyRuleBulkUpdateItem
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		if len(body) != 2 {
+			t.Fatalf("expected 2 items in request body, got %d", len(body))
+		}
+
+		writeJSON(t, w, PolicyRulesBulkCreateResponse{
+			NumberOfFailed:    0,
+			NumberOfSucceeded: 2,
+			Result:            "success",
+			Succeeded:         []string{body[0].ID, body[1].ID},
+			TotalNumber:       2,
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	items := []PolicyRuleBulkUpdateItem{
+		{ID: "rule-1", Rule: map[string]any{"action": "ALLOW"}},
+		{ID: "rule-2", Rule: map[string]any{"action": "BLOCK"}},
+	}
+
+	resp, err := client.BulkUpdatePolicyRules(context.Background(), items)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if resp.NumberOfSucceeded != 2 {
+		t.Fatalf("expected 2 succeeded, got %d", resp.NumberOfSucceeded)
+	}
+}
+
+func TestClient_BulkUpdatePolicyRules_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"error":"internal error"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.BulkUpdatePolicyRules(context.Background(), []PolicyRuleBulkUpdateItem{{ID: "rule-1", Rule: map[string]any{"action": "ALLOW"}}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to bulk update policy rules") {
+		t.Errorf("expected 'failed to bulk update policy rules' error, got: %v", err)
+	}
+}
+
+func TestClient_BulkDeletePolicyRules(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v4.0/visibility/policy/rules/delete/bulk" {
+			t.Errorf("expected path '/api/v4.0/visibility/policy/rules/delete/bulk', got '%s'", r.URL.Path)
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("expected method POST, got '%s'", r.Method)
+		}
+
+		var body []PolicyRuleBulkDeleteItem
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		if len(body) != 2 {
+			t.Fatalf("expected 2 items in request body, got %d", len(body))
+		}
+
+		writeJSON(t, w, PolicyRulesBulkCreateResponse{
+			NumberOfFailed:    0,
+			NumberOfSucceeded: 2,
+			Result:            "success",
+			Succeeded:         []string{body[0].ID, body[1].ID},
+			TotalNumber:       2,
+		})
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	items := []PolicyRuleBulkDeleteItem{
+		{ID: "rule-1"},
+		{ID: "rule-2"},
+	}
+
+	resp, err := client.BulkDeletePolicyRules(context.Background(), items)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if resp.NumberOfSucceeded != 2 {
+		t.Fatalf("expected 2 succeeded, got %d", resp.NumberOfSucceeded)
+	}
+}
+
+func TestClient_BulkDeletePolicyRules_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"error":"internal error"}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.BulkDeletePolicyRules(context.Background(), []PolicyRuleBulkDeleteItem{{ID: "rule-1"}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to bulk delete policy rules") {
+		t.Errorf("expected 'failed to bulk delete policy rules' error, got: %v", err)
 	}
 }
 
@@ -4117,6 +4901,177 @@ func TestClient_CreateDnsBlocklist_Error(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to create DNS blocklist") {
 		t.Errorf("expected 'failed to create DNS blocklist' error, got: %v", err)
+	}
+}
+
+func TestClient_CreateDnsBlocklist_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.CreateDnsBlocklist(context.Background(), &DnsBlocklistCreate{Name: "test", Type: "CUSTOM_BLOCK"})
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_GetDnsBlocklist_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.GetDnsBlocklist(context.Background(), "dns-123")
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_UpdateDnsBlocklist_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.UpdateDnsBlocklist(context.Background(), "dns-123", &DnsBlocklistEdit{})
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_DeleteDnsBlocklist_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.DeleteDnsBlocklist(context.Background(), "dns-123")
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_ListDnsBlocklists_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.ListDnsBlocklists(context.Background(), "", "")
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_BulkCreateDnsBlocklists_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := client.BulkCreateDnsBlocklists(context.Background(), []DnsBlocklistCreate{{Name: "test", Type: "CUSTOM_BLOCK"}})
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_BulkDeleteDnsBlocklists_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.BulkDeleteDnsBlocklists(context.Background(), []string{"id-1"})
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_BulkEditDnsBlocklists_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.BulkEditDnsBlocklists(context.Background(), &BulkEditDnsBlocklistRequest{Items: []BulkEditDnsBlocklistItem{{ID: "id-1"}}})
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
+	}
+}
+
+func TestClient_ResetDnsBlocklistHitCount_FeatureDisabled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"Could not complete the operation due to a server error. See error for more details","error_code":"OperationFailed","error_dump":"('%s is not enabled', 'DNS Security')"}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	err := client.ResetDnsBlocklistHitCount(context.Background(), "id-1")
+	if err != ErrDnsSecurityFeatureDisabled {
+		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
 
@@ -4446,6 +5401,134 @@ func TestClient_AuthenticateIfStale_NoAuthMethod(t *testing.T) {
 	}
 }
 
+func TestAuthenticateWithRetry_SucceedsAfterTransientFailure(t *testing.T) {
+	origDelay := authRetryBaseDelay
+	authRetryBaseDelay = time.Millisecond
+	defer func() { authRetryBaseDelay = origDelay }()
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n <= 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"message":"Internal Server Error"}`)
+			return
+		}
+		writeJSON(t, w, AuthResponse{AccessToken: testJWTGenerated})
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config: Config{
+			BaseURL:  server.URL,
+			Username: "admin",
+			Password: "password",
+		},
+		httpClient: server.Client(),
+	}
+
+	err := c.authenticateWithRetry(context.Background(), "")
+	if err != nil {
+		t.Fatalf("expected success after retry, got: %v", err)
+	}
+	if c.token != testJWTGenerated {
+		t.Errorf("expected token %q, got %q", testJWTGenerated, c.token)
+	}
+	if atomic.LoadInt32(&attempts) < 2 {
+		t.Errorf("expected at least 2 attempts, got %d", atomic.LoadInt32(&attempts))
+	}
+}
+
+func TestAuthenticateWithRetry_ExhaustsRetries(t *testing.T) {
+	origDelay := authRetryBaseDelay
+	authRetryBaseDelay = time.Millisecond
+	defer func() { authRetryBaseDelay = origDelay }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"message":"Internal Server Error"}`)
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config: Config{
+			BaseURL:  server.URL,
+			Username: "admin",
+			Password: "password",
+		},
+		httpClient: server.Client(),
+	}
+
+	err := c.authenticateWithRetry(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if !strings.Contains(err.Error(), "authentication failed after") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestAuthenticateWithRetry_NoRetryOnBadCredentials(t *testing.T) {
+	origDelay := authRetryBaseDelay
+	authRetryBaseDelay = time.Millisecond
+	defer func() { authRetryBaseDelay = origDelay }()
+
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusOK)
+		writeJSON(t, w, AuthResponse{AccessToken: ""})
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config: Config{
+			BaseURL:  server.URL,
+			Username: "admin",
+			Password: "wrong",
+		},
+		httpClient: server.Client(),
+	}
+
+	err := c.authenticateWithRetry(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty token")
+	}
+	if atomic.LoadInt32(&attempts) != 1 {
+		t.Errorf("expected exactly 1 attempt (no retry for non-transient error), got %d", atomic.LoadInt32(&attempts))
+	}
+}
+
+func TestIsTransientAuthError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{"nil", nil, false},
+		{"eof", fmt.Errorf("failed to authenticate: Post \"https://example.com\": EOF"), true},
+		{"tls error", fmt.Errorf("tls: server did not echo the legacy session ID"), true},
+		{"connection reset", fmt.Errorf("connection reset by peer"), true},
+		{"timeout", fmt.Errorf("request timeout"), true},
+		{"internal server error", fmt.Errorf("password authentication failed: internal server error"), true},
+		{"empty access token", fmt.Errorf("password authentication succeeded but returned empty access token"), false},
+		{"invalid jwt", fmt.Errorf("does not appear to be a valid jwt"), false},
+		{"mfa", fmt.Errorf("multi-factor authentication required"), false},
+		{"no auth method", fmt.Errorf("no valid authentication method configured"), false},
+		{"refresh expired", fmt.Errorf("refresh token may be expired or invalid"), false},
+		{"generic error", fmt.Errorf("some unknown error"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransientAuthError(tt.err)
+			if got != tt.transient {
+				t.Errorf("isTransientAuthError(%v) = %v, want %v", tt.err, got, tt.transient)
+			}
+		})
+	}
+}
+
 func TestClient_ConcurrentRetryOn401(t *testing.T) {
 	var authCallCount int64
 
@@ -4520,6 +5603,285 @@ func TestClient_ConcurrentRetryOn401(t *testing.T) {
 
 	if c.token != testJWTNew {
 		t.Errorf("expected token 'new-token', got '%s'", c.token)
+	}
+}
+
+func TestClient_RetryOn429_WithRetryAfter(t *testing.T) {
+	oldRetries := maxRequestRetries
+	maxRequestRetries = 1
+	t.Cleanup(func() {
+		maxRequestRetries = oldRetries
+	})
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v4.0/labels/label-429" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+
+		current := atomic.AddInt32(&callCount, 1)
+		if current == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"description":"rate limited"}`))
+			return
+		}
+
+		writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-429", Key: "K", Value: "V"}}})
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+
+	label, err := c.GetLabel(ctx, "label-429")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if label == nil || label.ID != "label-429" {
+		t.Fatalf("expected label label-429, got %#v", label)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 2 {
+		t.Fatalf("expected 2 calls, got %d", got)
+	}
+}
+
+func TestClient_RetryOn5xx_TransientSuccess(t *testing.T) {
+	oldRetries := maxRequestRetries
+	oldBaseDelay := retryBaseDelay
+	oldMaxDelay := retryMaxDelay
+	maxRequestRetries = 3
+	retryBaseDelay = time.Millisecond
+	retryMaxDelay = 5 * time.Millisecond
+	t.Cleanup(func() {
+		maxRequestRetries = oldRetries
+		retryBaseDelay = oldBaseDelay
+		retryMaxDelay = oldMaxDelay
+	})
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&callCount, 1)
+		switch current {
+		case 1:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("server error"))
+		case 2:
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("gateway error"))
+		default:
+			writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "label-5xx", Key: "K", Value: "V"}}})
+		}
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	label, err := c.GetLabel(context.Background(), "label-5xx")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if label == nil || label.ID != "label-5xx" {
+		t.Fatalf("expected label label-5xx, got %#v", label)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 3 {
+		t.Fatalf("expected 3 calls, got %d", got)
+	}
+}
+
+func TestClient_RetryOn429_StopsAfterMaxRetries(t *testing.T) {
+	oldRetries := maxRequestRetries
+	oldBaseDelay := retryBaseDelay
+	oldMaxDelay := retryMaxDelay
+	maxRequestRetries = 2
+	retryBaseDelay = time.Millisecond
+	retryMaxDelay = 5 * time.Millisecond
+	t.Cleanup(func() {
+		maxRequestRetries = oldRetries
+		retryBaseDelay = oldBaseDelay
+		retryMaxDelay = oldMaxDelay
+	})
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"description":"rate limited"}`))
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := c.GetLabel(context.Background(), "label-429-loop")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to get label: status 429") {
+		t.Fatalf("expected status 429 error, got %v", err)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 3 {
+		t.Fatalf("expected 3 calls (initial + 2 retries), got %d", got)
+	}
+}
+
+func TestClient_NoRetryOn403(t *testing.T) {
+	oldRetries := maxRequestRetries
+	maxRequestRetries = 3
+	t.Cleanup(func() {
+		maxRequestRetries = oldRetries
+	})
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"forbidden"}`))
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := c.GetLabel(context.Background(), "label-403")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to get label: status 403") {
+		t.Fatalf("expected status 403 error, got %v", err)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Fatalf("expected 1 call, got %d", got)
+	}
+}
+
+func TestClient_RequestTimeout_ClassifiedCorrectly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(120 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		writeJSON(t, w, LabelGetResponse{Objects: []Label{{ID: "slow"}}})
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config: Config{BaseURL: server.URL},
+		httpClient: &http.Client{
+			Timeout: 20 * time.Millisecond,
+		},
+		token: "test-token",
+	}
+
+	_, err := c.GetLabel(context.Background(), "slow")
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "request GET /api/v4.0/labels/slow failed") {
+		t.Fatalf("expected contextual request failure, got %v", err)
+	}
+}
+
+func TestClient_RefreshTokenExpired_ReturnsActionableError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3.0/authenticate/refresh" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"description":"refresh expired"}`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient(Config{BaseURL: server.URL, RefreshToken: "expired"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "refresh token may be expired or invalid") {
+		t.Fatalf("expected actionable refresh token message, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "access_token") {
+		t.Fatalf("expected access_token guidance, got %v", err)
+	}
+}
+
+func TestClient_MissingCredentials_FailsFastWithoutRequest(t *testing.T) {
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	_, err := NewClient(Config{BaseURL: server.URL})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no valid authentication method configured") {
+		t.Fatalf("expected missing auth error, got %v", err)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 0 {
+		t.Fatalf("expected 0 requests, got %d", got)
+	}
+}
+
+func TestClient_ForbiddenOnResourceOperation_NotRetried(t *testing.T) {
+	oldRetries := maxRequestRetries
+	maxRequestRetries = 3
+	t.Cleanup(func() {
+		maxRequestRetries = oldRetries
+	})
+
+	var callCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&callCount, 1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"description":"forbidden"}`))
+	}))
+	defer server.Close()
+
+	c := &Client{
+		config:     Config{BaseURL: server.URL},
+		httpClient: http.DefaultClient,
+		token:      "test-token",
+	}
+
+	_, err := c.BulkUpdateAssets(context.Background(), []AssetBulkUpdateItem{{AssetID: "asset-1", Comments: "updated"}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "failed to bulk update assets: status 403") {
+		t.Fatalf("expected status 403 error, got %v", err)
+	}
+	if got := atomic.LoadInt32(&callCount); got != 1 {
+		t.Fatalf("expected 1 request, got %d", got)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	if got, ok := parseRetryAfter("2"); !ok || got != 2*time.Second {
+		t.Fatalf("expected 2s, got %v ok=%v", got, ok)
+	}
+
+	if _, ok := parseRetryAfter("0"); ok {
+		t.Fatal("expected zero retry-after to be ignored")
+	}
+
+	if _, ok := parseRetryAfter("not-a-time"); ok {
+		t.Fatal("expected invalid retry-after to be ignored")
 	}
 }
 
@@ -4871,5 +6233,191 @@ func TestLooksLikeJWT(t *testing.T) {
 				t.Errorf("looksLikeJWT(%q) = %v, want %v", tt.token, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFlattenValidationErrors(t *testing.T) {
+	tests := []struct {
+		name     string
+		prefix   string
+		input    any
+		expected []string
+	}{
+		{
+			name:     "simple string array leaf",
+			prefix:   "field",
+			input:    []any{"error message"},
+			expected: []string{"field: error message"},
+		},
+		{
+			name:   "nested object with numeric keys",
+			prefix: "",
+			input: map[string]any{
+				"criteria": map[string]any{
+					"1": map[string]any{
+						"compound_criteria": []any{"Unknown field"},
+						"op":                []any{"Must be one of EQUALS, STARTSWITH"},
+					},
+				},
+			},
+			expected: []string{
+				"criteria[1].compound_criteria: Unknown field",
+				"criteria[1].op: Must be one of EQUALS, STARTSWITH",
+			},
+		},
+		{
+			name:   "multiple numeric indices",
+			prefix: "",
+			input: map[string]any{
+				"criteria": map[string]any{
+					"0": map[string]any{
+						"field": []any{"Required"},
+					},
+					"1": map[string]any{
+						"op": []any{"Invalid value"},
+					},
+				},
+			},
+			expected: []string{
+				"criteria[0].field: Required",
+				"criteria[1].op: Invalid value",
+			},
+		},
+		{
+			name:     "nil input",
+			prefix:   "",
+			input:    nil,
+			expected: nil,
+		},
+		{
+			name:     "string leaf value",
+			prefix:   "field",
+			input:    "single error",
+			expected: []string{"field: single error"},
+		},
+		{
+			name:     "empty map",
+			prefix:   "",
+			input:    map[string]any{},
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := flattenValidationErrors(tt.prefix, tt.input)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("expected %d results, got %d: %v", len(tt.expected), len(got), got)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("result[%d]: expected %q, got %q", i, tt.expected[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseBulkLabelValidationError(t *testing.T) {
+	t.Run("valid validation error", func(t *testing.T) {
+		body := []byte(`{"message":{"json":{"3":{"criteria":{"1":{"compound_criteria":["Unknown field"],"op":["Must be one of EQUALS"]}}},"4":{"criteria":{"2":{"compound_criteria":["Unknown field"]}}}}}}`)
+		result := parseBulkLabelValidationError(400, body)
+		if result == nil {
+			t.Fatal("expected non-nil result")
+			return
+		}
+		if len(result.ItemErrors) != 2 {
+			t.Fatalf("expected 2 item errors, got %d", len(result.ItemErrors))
+		}
+		item3, ok := result.ItemErrors[3]
+		if !ok {
+			t.Fatal("expected error for index 3")
+		}
+		if len(item3.Messages) != 2 {
+			t.Fatalf("expected 2 messages for index 3, got %d: %v", len(item3.Messages), item3.Messages)
+		}
+		item4, ok := result.ItemErrors[4]
+		if !ok {
+			t.Fatal("expected error for index 4")
+		}
+		if len(item4.Messages) != 1 {
+			t.Fatalf("expected 1 message for index 4, got %d: %v", len(item4.Messages), item4.Messages)
+		}
+	})
+
+	t.Run("non-validation JSON", func(t *testing.T) {
+		body := []byte(`{"description":"server error","error_code":"InternalError"}`)
+		result := parseBulkLabelValidationError(400, body)
+		if result != nil {
+			t.Fatal("expected nil for non-validation error JSON")
+		}
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		result := parseBulkLabelValidationError(400, []byte(`not json`))
+		if result != nil {
+			t.Fatal("expected nil for invalid JSON")
+		}
+	})
+
+	t.Run("empty message.json", func(t *testing.T) {
+		body := []byte(`{"message":{"json":{}}}`)
+		result := parseBulkLabelValidationError(400, body)
+		if result != nil {
+			t.Fatal("expected nil for empty json map")
+		}
+	})
+
+	t.Run("non-numeric keys skipped", func(t *testing.T) {
+		body := []byte(`{"message":{"json":{"abc":{"field":["error"]}}}}`)
+		result := parseBulkLabelValidationError(400, body)
+		if result != nil {
+			t.Fatal("expected nil when all keys are non-numeric")
+		}
+	})
+}
+
+func TestBulkValidationError_ErrorForIndex(t *testing.T) {
+	bve := &BulkValidationError{
+		StatusCode: 400,
+		ItemErrors: map[int]*BulkItemError{
+			2: {Index: 2, Messages: []string{"criteria[0].op: Invalid"}},
+		},
+	}
+
+	err := bve.ErrorForIndex(2)
+	if err == nil {
+		t.Fatal("expected non-nil error for index 2")
+	}
+	if !strings.Contains(err.Error(), "criteria[0].op: Invalid") {
+		t.Fatalf("expected specific error, got: %s", err)
+	}
+
+	err = bve.ErrorForIndex(0)
+	if err == nil {
+		t.Fatal("expected non-nil error for index 0")
+	}
+	if !strings.Contains(err.Error(), "batch failed due to validation errors") {
+		t.Fatalf("expected generic error, got: %s", err)
+	}
+	if !strings.Contains(err.Error(), "2") {
+		t.Fatalf("expected failing index in message, got: %s", err)
+	}
+}
+
+func TestBulkValidationError_Error(t *testing.T) {
+	bve := &BulkValidationError{
+		StatusCode: 400,
+		ItemErrors: map[int]*BulkItemError{
+			1: {Index: 1, Messages: []string{"field: Required"}},
+			3: {Index: 3, Messages: []string{"op: Invalid", "criteria: Unknown"}},
+		},
+	}
+	errStr := bve.Error()
+	if !strings.Contains(errStr, "item[1]") || !strings.Contains(errStr, "item[3]") {
+		t.Fatalf("expected both item indices in error string, got: %s", errStr)
+	}
+	if !strings.Contains(errStr, "bulk validation error") {
+		t.Fatalf("expected 'bulk validation error' prefix, got: %s", errStr)
 	}
 }

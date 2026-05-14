@@ -27,7 +27,7 @@ output "asset_inventory_details" {
     nics                   = data.guardicore_asset.database_primary.nics
     labels                 = data.guardicore_asset.database_primary.labels
     comments               = data.guardicore_asset.database_primary.comments
-    orchestration_metadata = data.guardicore_asset.database_primary.orchestration_metadata_json
+    orchestration_metadata = data.guardicore_asset.database_primary.orchestration_metadata
     first_seen             = data.guardicore_asset.database_primary.first_seen
     last_seen              = data.guardicore_asset.database_primary.last_seen
   }

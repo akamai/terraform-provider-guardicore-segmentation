@@ -6,7 +6,7 @@ The importer CLI tool exports all existing resources from an Akamai Guardicore S
 
 When adopting Terraform for an existing Akamai Guardicore Segmentation deployment, you need to bring existing resources under Terraform management. The importer automates this by:
 
-1. Fetching all labels, label groups, policy rules, DNS blocklists, incidents, worksites, user groups, and assets from the Akamai Guardicore Segmentation API
+1. Fetching all labels, label groups, policy rules, DNS blocklists, incidents, worksites, user groups, assets, and agent aggregators from the Akamai Guardicore Segmentation API
 2. Generating `.tf` files with `resource` blocks matching each resource's current state
 3. Including `import` blocks so Terraform can associate the configuration with existing resources
 
@@ -150,6 +150,11 @@ import {
   to = guardicore_dns_security.malware_domains
   id = "mno-345"
 }
+
+# System-managed DNS blocklist types are exported as data sources.
+data "guardicore_dns_security" "gambling_category" {
+  id = "pqr-678"
+}
 ```
 
 ### incidents.tf
@@ -193,9 +198,9 @@ resource "guardicore_policy_rule" "allow_web_traffic" {
     label_group_ids = [guardicore_label_group.role_web_servers.id]
   }
 
-	ports        = [80, 443]
-	ip_protocols = ["TCP"]
-	worksite_id = guardicore_worksite.headquarters.id
+  ports        = [80, 443]
+  ip_protocols = ["TCP"]
+  worksite_id  = guardicore_worksite.headquarters.id
 }
 
 import {
@@ -205,6 +210,18 @@ import {
 ```
 
 Unsupported top-level policy rule extras are emitted through `raw_spec_json` when the importer cannot map them to typed Terraform attributes. Catch-all endpoints are represented by omitting `source` or `destination`, which the provider translates to empty endpoint objects for the API.
+
+Policy groups referenced by policy rules are imported as ID literals today because importer output does not yet generate policy group resources.
+
+### agent_aggregators.tf
+
+```hcl
+data "guardicore_agent_aggregator" "agg_01" {
+  id = "agr-12345"
+}
+```
+
+Agent aggregators are system-managed infrastructure components and are exported as data sources only.
 
 ### worksites.tf
 
@@ -248,17 +265,18 @@ resource "guardicore_asset" "web_server_01" {
   status = "on"
   worksite_id = guardicore_worksite.headquarters.id
 
-  labels {
-    id    = guardicore_label.environment_production.id
-    key   = "Environment"
-    value = "Production"
-  }
-
-  labels {
-    id    = guardicore_label.application_web_server.id
-    key   = "Application"
-    value = "Web Server"
-  }
+  labels = [
+    {
+      id    = guardicore_label.environment_production.id
+      key   = guardicore_label.environment_production.key
+      value = guardicore_label.environment_production.value
+    },
+    {
+      id    = guardicore_label.application_web_server.id
+      key   = guardicore_label.application_web_server.key
+      value = guardicore_label.application_web_server.value
+    },
+  ]
 
   nics = [
     {
@@ -281,6 +299,25 @@ import {
 3. **Run** `terraform plan` to verify the imported state matches (should show no changes)
 4. **Run** `terraform apply` to complete the import
 5. **Optionally** remove the `import` blocks after successful import (they are only needed once)
+
+### Asset labels behavior
+
+- The importer only writes user-manageable asset labels to `assets.tf`.
+- Labels with `read_only = true` are skipped because the API treats them as server-managed.
+- Labels with dynamic criteria are skipped because they are assigned automatically by the platform.
+- If assignability cannot be resolved from the labels API for a label ID, the importer includes the label as-is and logs a warning to stderr; Terraform apply may fail if the label is actually read-only or dynamic.
+- If a label cannot be resolved and has incomplete fields (missing key/value), it is skipped with a warning because the provider requires `id`, `key`, and `value`.
+
+### Asset NICs behavior
+
+- NICs with empty `ip_addresses` are skipped because the `guardicore_asset` resource requires at least one IP address per NIC. This commonly occurs for agent-reported assets (e.g., vSphere-orchestrated) where internal/virtual NICs are reported without IP assignments.
+- If all NICs on an asset have empty `ip_addresses`, the entire asset is skipped and rendered as a commented-out block with a note.
+- If only some NICs have empty `ip_addresses`, the asset is exported with only the valid NICs included.
+
+### Feature-flagged resources
+
+- If worksites are disabled in the Akamai Guardicore Segmentation instance, the importer skips worksites and logs a note to stderr.
+- Policy groups are not exported yet by the importer.
 
 ## Troubleshooting
 

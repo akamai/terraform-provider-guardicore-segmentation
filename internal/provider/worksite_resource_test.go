@@ -24,6 +24,8 @@ func TestAccWorksiteResource_basic(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("guardicore_worksite.test", "id"),
 					resource.TestCheckResourceAttr("guardicore_worksite.test", "name", name1),
+					resource.TestCheckResourceAttr("guardicore_worksite.test", "system_managed", "false"),
+					resource.TestCheckResourceAttr("guardicore_worksite.test", "managed_by", "terraform"),
 				),
 			},
 			// ImportState testing.
@@ -166,4 +168,63 @@ resource "guardicore_worksite" "test" {
   name = %[1]q
 }
 `, name)
+}
+
+func TestAccWorksiteResource_multipleResources(t *testing.T) {
+	name1 := testAccRandomName("tf-acc-worksite-m1")
+	name2 := testAccRandomName("tf-acc-worksite-m2")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccWorksitePreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_worksite"),
+		Steps: []resource.TestStep{{
+			Config: testAccWorksiteResourceConfigMultiple(name1, name2),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttrSet("guardicore_worksite.test1", "id"),
+				resource.TestCheckResourceAttrSet("guardicore_worksite.test2", "id"),
+			),
+		}},
+	})
+}
+
+func TestAccWorksiteResource_deleteBlockedByAssignedAsset(t *testing.T) {
+	name := testAccRandomName("tf-acc-worksite-blocked")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccWorksiteDeleteBlockedPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccWorksiteResourceConfig(name),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_worksite.test", "id"),
+					testAccAssignAssetToWorksiteOutOfBand("guardicore_worksite.test", testConfig.WorksiteAssignedAssetID),
+				),
+			},
+			{
+				Config:      testAccProviderConfig(),
+				ExpectError: regexp.MustCompile(`(?is)(Unable to delete worksite|failed to delete worksite).*(assigned|not deleted|skips=)`),
+			},
+			{
+				Config: testAccWorksiteResourceConfig(name),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_worksite.test", "id"),
+					testAccAssignAssetToAllWorksitesOutOfBand(testConfig.WorksiteAssignedAssetID),
+				),
+			},
+		},
+	})
+}
+
+func testAccWorksiteResourceConfigMultiple(name1, name2 string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_worksite" "test1" {
+  name = %[1]q
+}
+
+resource "guardicore_worksite" "test2" {
+  name = %[2]q
+}
+`, name1, name2)
 }

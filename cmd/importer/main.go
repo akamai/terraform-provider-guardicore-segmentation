@@ -17,7 +17,7 @@ func main() {
 	accessToken := flag.String("access-token", os.Getenv("GUARDICORE_ACCESS_TOKEN"), "Akamai Guardicore Segmentation access token (env: GUARDICORE_ACCESS_TOKEN)")
 	refreshToken := flag.String("refresh-token", os.Getenv("GUARDICORE_REFRESH_TOKEN"), "Akamai Guardicore Segmentation refresh token (env: GUARDICORE_REFRESH_TOKEN)")
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification")
-	requestTimeout := flag.Int64("request-timeout", 0, fmt.Sprintf("HTTP request timeout in seconds (default: %d)", client.DefaultRequestTimeout))
+	requestTimeout := flag.Int64("request-timeout", 0, fmt.Sprintf("HTTP request timeout in seconds (default: %d)", client.DefaultImporterRequestTimeout))
 	outputDir := flag.String("output-dir", ".", "Output directory for generated .tf files")
 
 	flag.Parse()
@@ -32,10 +32,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "WARNING: TLS certificate verification is disabled (--insecure). Connections are susceptible to man-in-the-middle attacks.")
 	}
 
-	// Use a longer default timeout for the importer (120s) since it fetches entire datasets.
 	timeout := *requestTimeout
 	if timeout <= 0 {
-		timeout = 120
+		timeout = client.DefaultImporterRequestTimeout
 	}
 
 	config := client.Config{

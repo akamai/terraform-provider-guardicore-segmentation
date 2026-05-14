@@ -4,11 +4,14 @@ page_title: "guardicore_dns_security Data Source - guardicore"
 subcategory: ""
 description: |-
   Retrieves information about a DNS security blocklist. You can look up a blocklist by its ID or by name.
+  ~> Note: The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a "DNS Security is not enabled" error, enable it in the Akamai Guardicore Segmentation management console before using this data source.
 ---
 
 # guardicore_dns_security (Data Source)
 
 Retrieves information about a DNS security blocklist. You can look up a blocklist by its ID or by name.
+
+~> **Note:** The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a "DNS Security is not enabled" error, enable it in the Akamai Guardicore Segmentation management console before using this data source.
 
 ## Example Usage
 
@@ -21,6 +24,12 @@ data "guardicore_dns_security" "by_id" {
 # Look up a DNS security blocklist by name.
 data "guardicore_dns_security" "malware_list" {
   name = "Known Malware Domains"
+}
+
+# System-managed DNS blocklist types (for example, AKAMAI_INTELLIGENCE and
+# WEB_CATEGORY) should be referenced via data sources.
+data "guardicore_dns_security" "akamai_intelligence" {
+  name = "Akamai Intelligence Feed"
 }
 
 output "dns_security_details" {
@@ -44,6 +53,6 @@ output "dns_security_details" {
 
 ### Read-Only
 
-- `domains` (List of String) The list of domains in the blocklist.
+- `domains` (Set of String) The set of domains in the blocklist.
 - `enabled` (Boolean) Whether the DNS blocklist is enabled.
 - `type` (String) The type of the DNS blocklist.

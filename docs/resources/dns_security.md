@@ -4,21 +4,18 @@ page_title: "guardicore_dns_security Resource - guardicore"
 subcategory: ""
 description: |-
   Manages a DNS security blocklist in Akamai Guardicore Segmentation. DNS blocklists allow you to block or exclude specific domains from DNS resolution.
+  ~> Note: The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a "DNS Security is not enabled" error, enable it in the Akamai Guardicore Segmentation management console before using this resource.
 ---
 
 # guardicore_dns_security (Resource)
 
 Manages a DNS security blocklist in Akamai Guardicore Segmentation. DNS blocklists allow you to block or exclude specific domains from DNS resolution.
 
+~> **Note:** The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a "DNS Security is not enabled" error, enable it in the Akamai Guardicore Segmentation management console before using this resource.
+
 ## Example Usage
 
 ```terraform
-resource "guardicore_dns_security" "akamai_intelligence" {
-  name    = "Akamai Intelligence Feed"
-  type    = "AKAMAI_INTELLIGENCE"
-  enabled = true
-}
-
 resource "guardicore_dns_security" "custom_block" {
   name    = "Known Malware Domains"
   type    = "CUSTOM_BLOCK"
@@ -39,12 +36,6 @@ resource "guardicore_dns_security" "custom_exclusion" {
     "internal.example.com",
     "trusted.partner.example",
   ]
-}
-
-resource "guardicore_dns_security" "web_category" {
-  name    = "Gambling Category"
-  type    = "WEB_CATEGORY"
-  enabled = true
 }
 
 resource "guardicore_dns_security" "custom_blocklist" {
@@ -74,11 +65,11 @@ resource "guardicore_dns_security" "exclusion_list" {
 ### Required
 
 - `name` (String) The name of the DNS blocklist.
-- `type` (String) The type of the DNS blocklist. Valid values: `AKAMAI_INTELLIGENCE`, `CUSTOM_BLOCK`, `CUSTOM_EXCLUSION`, `WEB_CATEGORY`, `CUSTOM_BLOCKLIST`, `EXCLUSION_LIST`.
+- `type` (String) The type of the DNS blocklist. Valid values: `AKAMAI_INTELLIGENCE`, `CUSTOM_BLOCK`, `CUSTOM_EXCLUSION`, `WEB_CATEGORY`, `CUSTOM_BLOCKLIST`, `EXCLUSION_LIST`. `AKAMAI_INTELLIGENCE` and `WEB_CATEGORY` are system-managed and cannot be used when creating this resource (use the `guardicore_dns_security` data source to reference them). Changing this requires resource replacement.
 
 ### Optional
 
-- `domains` (List of String) The list of domains in the blocklist.
+- `domains` (Set of String) The set of domains in the blocklist.
 - `enabled` (Boolean) Whether the DNS blocklist is enabled. Defaults to `true`.
 
 ### Read-Only

@@ -26,9 +26,11 @@ type WorksiteDataSource struct {
 
 // WorksiteDataSourceModel describes the data source data model.
 type WorksiteDataSourceModel struct {
-	ID      types.String `tfsdk:"id"`
-	Name    types.String `tfsdk:"name"`
-	Comment types.String `tfsdk:"comment"`
+	ID            types.String `tfsdk:"id"`
+	Name          types.String `tfsdk:"name"`
+	Comment       types.String `tfsdk:"comment"`
+	SystemManaged types.Bool   `tfsdk:"system_managed"`
+	ManagedBy     types.String `tfsdk:"managed_by"`
 }
 
 func (d *WorksiteDataSource) Metadata(ctx context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -38,6 +40,8 @@ func (d *WorksiteDataSource) Metadata(ctx context.Context, req datasource.Metada
 func (d *WorksiteDataSource) Schema(ctx context.Context, req datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Retrieves information about a worksite from Akamai Guardicore Segmentation. You can look up a worksite by its ID or by name.\n\n" +
+			"Use this data source to reference existing worksites, including the system-managed \"Default\" worksite " +
+			"that cannot be modified by Terraform. The `system_managed` attribute indicates whether the worksite is managed by the platform.\n\n" +
 			"~> **Note:** The worksites feature must be enabled on the Akamai Guardicore Segmentation instance.\n\n" +
 			"Assets and policy rules can be assigned to a worksite using the `worksite_id` attribute on `guardicore_asset` and `guardicore_policy_rule` resources.",
 
@@ -55,6 +59,14 @@ func (d *WorksiteDataSource) Schema(ctx context.Context, req datasource.SchemaRe
 			"comment": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "A comment for the worksite.",
+			},
+			"system_managed": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether this worksite is system-managed. The \"Default\" worksite is system-managed and cannot be updated or deleted by Terraform. Use the `guardicore_worksite` data source to reference it.",
+			},
+			"managed_by": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Identifies who manages this worksite. `terraform` for user-managed worksites, or `system` for the platform-managed \"Default\" worksite.",
 			},
 		},
 	}
@@ -144,6 +156,10 @@ func (d *WorksiteDataSource) Read(ctx context.Context, req datasource.ReadReques
 	data.ID = types.StringValue(worksite.ID)
 	data.Name = types.StringValue(worksite.Name)
 	data.Comment = types.StringValue(worksite.Comment)
+
+	sm, mb := WorksiteIsSystemManaged(worksite)
+	data.SystemManaged = types.BoolValue(sm)
+	data.ManagedBy = types.StringValue(mb)
 
 	tflog.Trace(ctx, "read worksite data source", map[string]any{"id": worksite.ID})
 

@@ -14,7 +14,7 @@ func TestAccDnsSecurityResource_basic(t *testing.T) {
 	name2 := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
 		Steps: []resource.TestStep{
@@ -52,7 +52,7 @@ func TestAccDnsSecurityResource_withDomains(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
 		Steps: []resource.TestStep{
@@ -72,7 +72,7 @@ func TestAccDnsSecurityResource_updateDomains(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
 		Steps: []resource.TestStep{
@@ -98,7 +98,7 @@ func TestAccDnsSecurityResource_enabled(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
 		Steps: []resource.TestStep{
@@ -120,11 +120,36 @@ func TestAccDnsSecurityResource_enabled(t *testing.T) {
 	})
 }
 
+func TestAccDnsSecurityResource_typeImmutability(t *testing.T) {
+	name := testAccRandomName("tf-acc-dns-immutable")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDnsSecurityResourceConfig(name, "CUSTOM_BLOCK"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("guardicore_dns_security.test", "type", "CUSTOM_BLOCK"),
+				),
+			},
+			// Changing type should require replacement.
+			{
+				Config: testAccDnsSecurityResourceConfig(name, "CUSTOM_EXCLUSION"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("guardicore_dns_security.test", "type", "CUSTOM_EXCLUSION"),
+				),
+			},
+		},
+	})
+}
+
 func TestAccDnsSecurityResource_disappears(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
 		Steps: []resource.TestStep{
@@ -150,12 +175,67 @@ func TestAccDnsSecurityResource_invalidType(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
 				Config:      testAccDnsSecurityResourceConfig(name, "INVALID"),
 				ExpectError: regexp.MustCompile(".*"),
+			},
+		},
+	})
+}
+
+func TestAccDnsSecurityResource_createAkamaiIntelligenceBlocked(t *testing.T) {
+	name := testAccRandomName("tf-acc-dns")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccDnsSecurityResourceConfig(name, "AKAMAI_INTELLIGENCE"),
+				ExpectError: regexp.MustCompile(`(?i)system-managed.*cannot be used when creating`),
+			},
+		},
+	})
+}
+
+func TestAccDnsSecurityResource_createWebCategoryBlocked(t *testing.T) {
+	name := testAccRandomName("tf-acc-dns")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccDnsSecurityResourceConfig(name, "WEB_CATEGORY"),
+				ExpectError: regexp.MustCompile(`(?i)system-managed.*cannot be used when creating`),
+			},
+		},
+	})
+}
+
+func TestAccDnsSecurityResource_eventualConsistencyReadAfterCreate(t *testing.T) {
+	restoreHook := setReadAfterCreateVisibilityHookForTest(func(resourceName string, attempt int) bool {
+		return resourceName == "dns blocklist" && attempt <= 2
+	})
+	t.Cleanup(restoreHook)
+
+	name := testAccRandomName("tf-acc-dns-ec")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDnsSecurityResourceConfig(name, "CUSTOM_BLOCK"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_dns_security.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_dns_security.test", "name", name),
+					resource.TestCheckResourceAttr("guardicore_dns_security.test", "type", "CUSTOM_BLOCK"),
+				),
 			},
 		},
 	})
@@ -202,4 +282,38 @@ resource "guardicore_dns_security" "test" {
   enabled = %[4]t
 }
 `, name, listType, domainsList, enabled)
+}
+
+func TestAccDnsSecurityResource_multipleResources(t *testing.T) {
+	name1 := testAccRandomName("tf-acc-dns-m1")
+	name2 := testAccRandomName("tf-acc-dns-m2")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_dns_security"),
+		Steps: []resource.TestStep{{
+			Config: testAccDnsSecurityResourceConfigMultiple(name1, name2),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttrSet("guardicore_dns_security.test1", "id"),
+				resource.TestCheckResourceAttrSet("guardicore_dns_security.test2", "id"),
+			),
+		}},
+	})
+}
+
+func testAccDnsSecurityResourceConfigMultiple(name1, name2 string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_dns_security" "test1" {
+  name    = %[1]q
+  type    = "CUSTOM_BLOCK"
+  domains = ["multi-1.example.com"]
+}
+
+resource "guardicore_dns_security" "test2" {
+  name    = %[2]q
+  type    = "CUSTOM_BLOCK"
+  domains = ["multi-2.example.com"]
+}
+`, name1, name2)
 }

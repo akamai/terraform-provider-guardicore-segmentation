@@ -177,6 +177,78 @@ func TestPolicyGroupMembersValidator_Description(t *testing.T) {
 	}
 }
 
+func TestPolicyGroupMembersValidator_NullValue(t *testing.T) {
+	v := PolicyGroupMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("members_json"),
+		ConfigValue: types.StringNull(),
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("expected no errors for null, got %v", resp.Diagnostics.Errors())
+	}
+}
+
+func TestPolicyGroupMembersValidator_UnknownValue(t *testing.T) {
+	v := PolicyGroupMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("members_json"),
+		ConfigValue: types.StringUnknown(),
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("expected no errors for unknown, got %v", resp.Diagnostics.Errors())
+	}
+}
+
+func TestPolicyGroupMembersValidator_EmptyString(t *testing.T) {
+	v := PolicyGroupMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("members_json"),
+		ConfigValue: types.StringValue(""),
+	}, resp)
+	if !resp.Diagnostics.HasError() {
+		t.Error("expected error for empty string")
+	}
+}
+
+func TestPolicyGroupExcludeMembersValidator_NullValue(t *testing.T) {
+	v := PolicyGroupExcludeMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("exclude_members_json"),
+		ConfigValue: types.StringNull(),
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("expected no errors for null, got %v", resp.Diagnostics.Errors())
+	}
+}
+
+func TestPolicyGroupExcludeMembersValidator_UnknownValue(t *testing.T) {
+	v := PolicyGroupExcludeMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("exclude_members_json"),
+		ConfigValue: types.StringUnknown(),
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("expected no errors for unknown, got %v", resp.Diagnostics.Errors())
+	}
+}
+
+func TestPolicyGroupExcludeMembersValidator_EmptyString(t *testing.T) {
+	v := PolicyGroupExcludeMembersValidator("type")
+	resp := &validator.StringResponse{}
+	v.ValidateString(context.Background(), validator.StringRequest{
+		Path:        path.Root("exclude_members_json"),
+		ConfigValue: types.StringValue(""),
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("expected no errors for empty string, got %v", resp.Diagnostics.Errors())
+	}
+}
+
 func TestPolicyGroupExcludeMembersValidator_Description(t *testing.T) {
 	v := PolicyGroupExcludeMembersValidator("type")
 

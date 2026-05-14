@@ -3,10 +3,12 @@ package provider
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/normalize"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -28,8 +30,10 @@ func NewPolicyRuleResource() resource.Resource {
 
 // PolicyRuleResource defines the resource implementation.
 type PolicyRuleResource struct {
-	client  *client.Client
-	batcher *PolicyRuleCreateBatcher
+	client        *client.Client
+	createBatcher *Batcher[map[string]any, string]
+	updateBatcher *Batcher[policyRuleUpdateReq, struct{}]
+	deleteBatcher *Batcher[string, struct{}]
 }
 
 // PolicyRuleResourceModel describes the resource data model.
@@ -68,6 +72,7 @@ func (r *PolicyRuleResource) Schema(ctx context.Context, req resource.SchemaRequ
 	Use ` + "`raw_spec_json`" + ` only for unsupported top-level extras that do not yet have a typed Terraform attribute. The full API response is exposed as ` + "`raw_json`" + `.
 	The API may represent worksite assignment inside policy rule attributes, but Terraform manages it as the top-level ` + "`worksite_id`" + ` attribute.
 	The ` + "`icmp_matches.version`" + ` field is treated as a pass-through string so environments can keep using the representation their API returns.
+	Each ` + "`icmp_matches[*].icmp_codes`" + ` value is always imported and sent to the API; when omitted, the provider defaults it to an empty list.
 
 Example:
 
@@ -189,7 +194,9 @@ func (r *PolicyRuleResource) Configure(ctx context.Context, req resource.Configu
 	}
 
 	r.client = providerData.Client
-	r.batcher = providerData.PolicyRuleBatcher
+	r.createBatcher = providerData.PolicyRuleCreateBatcher
+	r.updateBatcher = providerData.PolicyRuleUpdateBatcher
+	r.deleteBatcher = providerData.PolicyRuleDeleteBatcher
 }
 
 func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -210,12 +217,12 @@ func (r *PolicyRuleResource) Create(ctx context.Context, req resource.CreateRequ
 		return
 	}
 
-	if r.batcher == nil {
+	if r.createBatcher == nil {
 		resp.Diagnostics.AddError("Client Error", "Policy rule batcher is not configured")
 		return
 	}
 
-	id, err := r.batcher.EnqueueCreate(ctx, spec)
+	id, err := r.createBatcher.Enqueue(ctx, spec)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create policy rule, got error: %s", err))
 		return
@@ -287,6 +294,12 @@ func (r *PolicyRuleResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
+	var stateData PolicyRuleResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &stateData)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	spec, diags := buildPolicyRuleSpecFromModel(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -297,28 +310,15 @@ func (r *PolicyRuleResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
-	err := r.client.UpdatePolicyRule(ctx, data.ID.ValueString(), spec)
-	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update policy rule, got error: %s", err))
-		return
-	}
-
-	revisionOrigin := "API_CALL"
-	revisionRequest := &client.PolicyRevisionRequest{
-		Comments: "Published via Terraform",
-		Rulesets: []string{},
-		Origin:   &revisionOrigin,
-	}
-	if err := r.client.CreatePolicyRevision(ctx, revisionRequest); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to publish policy rule, got error: %s", err))
-		return
-	}
-
-	// Handle worksite assignment changes
-	var stateData PolicyRuleResourceModel
-	resp.Diagnostics.Append(req.State.Get(ctx, &stateData)...)
-	if resp.Diagnostics.HasError() {
-		return
+	stateSpec, _ := buildPolicyRuleSpecFromModel(ctx, &stateData)
+	if !reflect.DeepEqual(spec, stateSpec) {
+		if _, err := r.updateBatcher.Enqueue(ctx, policyRuleUpdateReq{
+			id:   data.ID.ValueString(),
+			spec: spec,
+		}); err != nil {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update policy rule, got error: %s", err))
+			return
+		}
 	}
 
 	oldWorksite := stateData.WorksiteID
@@ -361,20 +361,8 @@ func (r *PolicyRuleResource) Delete(ctx context.Context, req resource.DeleteRequ
 		return
 	}
 
-	err := r.client.DeletePolicyRule(ctx, data.ID.ValueString())
-	if err != nil {
+	if _, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString()); err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete policy rule, got error: %s", err))
-		return
-	}
-
-	revisionOrigin := "API_CALL"
-	revisionRequest := &client.PolicyRevisionRequest{
-		Comments: "Published via Terraform",
-		Rulesets: []string{},
-		Origin:   &revisionOrigin,
-	}
-	if err := r.client.CreatePolicyRevision(ctx, revisionRequest); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to publish policy rule, got error: %s", err))
 		return
 	}
 
@@ -411,10 +399,23 @@ func extractWorksiteIDFromRule(rule map[string]any) types.String {
 	return types.StringValue(idStr)
 }
 
+func preserveEmptyList(original types.List, elementType attr.Type) types.List {
+	if !original.IsNull() && !original.IsUnknown() && len(original.Elements()) == 0 {
+		return original
+	}
+	return types.ListNull(elementType)
+}
+
 func updatePolicyRuleModelFromAPI(ctx context.Context, data *PolicyRuleResourceModel, apiRule map[string]any, effectiveSpec map[string]any) diag.Diagnostics {
 	var diags diag.Diagnostics
 	originalSource := data.Source
 	originalDestination := data.Destination
+	originalIPProtocols := data.IPProtocols
+	originalPorts := data.Ports
+	originalExcludePorts := data.ExcludePorts
+	originalPortRanges := data.PortRanges
+	originalExcludePortRanges := data.ExcludePortRanges
+	originalScope := data.Scope
 
 	normalizedRule := normalize.NormalizePolicyRuleSpec(apiRule)
 	rawJSON, err := normalize.NormalizeJSON(normalizedRule)
@@ -470,32 +471,32 @@ func updatePolicyRuleModelFromAPI(ctx context.Context, data *PolicyRuleResourceM
 		diags.Append(d...)
 		data.IPProtocols = value
 	} else {
-		data.IPProtocols = types.ListNull(types.StringType)
+		data.IPProtocols = preserveEmptyList(originalIPProtocols, types.StringType)
 	}
 	if value, d := listIntsFromAny(ctx, effectiveSpec["ports"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
 		data.Ports = value
 	} else {
-		data.Ports = types.ListNull(types.Int64Type)
+		data.Ports = preserveEmptyList(originalPorts, types.Int64Type)
 	}
 	if value, d := listIntsFromAny(ctx, effectiveSpec["exclude_ports"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
 		data.ExcludePorts = value
 	} else {
-		data.ExcludePorts = types.ListNull(types.Int64Type)
+		data.ExcludePorts = preserveEmptyList(originalExcludePorts, types.Int64Type)
 	}
 
 	if value, d := policyRuleRangeListFromAny(effectiveSpec["port_ranges"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
 		data.PortRanges = value
 	} else {
-		data.PortRanges = types.ListNull(types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()})
+		data.PortRanges = preserveEmptyList(originalPortRanges, types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()})
 	}
 	if value, d := policyRuleRangeListFromAny(effectiveSpec["exclude_port_ranges"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
 		data.ExcludePortRanges = value
 	} else {
-		data.ExcludePortRanges = types.ListNull(types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()})
+		data.ExcludePortRanges = preserveEmptyList(originalExcludePortRanges, types.ObjectType{AttrTypes: policyRuleRangeAttrTypes()})
 	}
 	if value, d := policyRuleICMPMatchListFromAny(ctx, effectiveSpec["icmp_matches"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
@@ -511,6 +512,8 @@ func updatePolicyRuleModelFromAPI(ctx context.Context, data *PolicyRuleResourceM
 	if value, d := listStringsFromAny(ctx, effectiveSpec["scope"]); !value.IsNull() || d.HasError() {
 		diags.Append(d...)
 		data.Scope = value
+	} else if !originalScope.IsNull() && !originalScope.IsUnknown() {
+		data.Scope = originalScope
 	} else {
 		data.Scope = types.ListNull(types.StringType)
 	}

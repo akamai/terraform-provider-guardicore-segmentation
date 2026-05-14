@@ -14,6 +14,7 @@ import (
 // The *client.Client struct satisfies this interface naturally.
 type ReferenceChecker interface {
 	GetLabel(ctx context.Context, id string) (*client.Label, error)
+	ListLabels(ctx context.Context, key, value string) ([]client.Label, error)
 	GetLabelGroup(ctx context.Context, id string) (*client.LabelGroup, error)
 	GetUserGroup(ctx context.Context, id string) (*client.UserGroup, error)
 	GetAsset(ctx context.Context, id string) (*client.Asset, error)
@@ -276,6 +277,10 @@ func validatePolicyRuleRefsMap(ctx context.Context, checker ReferenceChecker, sp
 				continue
 			}
 
+			if shapeDiags := validatePolicyRuleEndpointReferenceShape(endpointKey, refKey, refs); shapeDiags.HasError() {
+				diags.Append(shapeDiags...)
+			}
+
 			var refIDs []string
 			switch typed := refs.(type) {
 			case []any:
@@ -354,8 +359,36 @@ func validatePolicyRuleRefsMap(ctx context.Context, checker ReferenceChecker, sp
 	return diags
 }
 
+func validatePolicyRuleEndpointReferenceShape(endpointKey, refKey string, refs any) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	var refSlice []any
+	switch typed := refs.(type) {
+	case []any:
+		refSlice = typed
+	case []string:
+		return diags
+	default:
+		return diags
+	}
+
+	for i, ref := range refSlice {
+		if _, ok := ref.(string); ok {
+			continue
+		}
+		location := fmt.Sprintf("policy_rule.%s.%s[%d]", endpointKey, refKey, i)
+		diags.AddError(
+			"Invalid Policy Rule Endpoint Reference",
+			fmt.Sprintf("Expected %s to be a string ID, got %T. Use a list of IDs in %s (for example: [\"id-1\", \"id-2\"]).", location, ref, location),
+		)
+	}
+
+	return diags
+}
+
 // validateAssetLabelRefs validates that all label references in an asset's
-// labels block exist in Akamai Guardicore Segmentation (by ID).
+// labels block exist in Akamai Guardicore Segmentation (by ID), and that
+// referenced labels are assignable to assets (not read-only and not dynamic).
 func validateAssetLabelRefs(ctx context.Context, checker ReferenceChecker, labels []AssetLabelModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 
@@ -364,10 +397,86 @@ func validateAssetLabelRefs(ctx context.Context, checker ReferenceChecker, label
 			continue
 		}
 		location := fmt.Sprintf("labels[%d]", i)
-		diags.Append(validateLabelExists(ctx, checker, label.ID.ValueString(), location)...)
+
+		labelID := label.ID.ValueString()
+		apiLabel, err := checker.GetLabel(ctx, labelID)
+		if err != nil {
+			diags.AddError(
+				"Reference Validation Error",
+				fmt.Sprintf("Unable to verify label %q referenced in %s: %s", labelID, location, err),
+			)
+			continue
+		}
+
+		if apiLabel == nil {
+			diags.AddError(
+				"Invalid Label Reference",
+				fmt.Sprintf("Label %q referenced in %s does not exist in Akamai Guardicore Segmentation.", labelID, location),
+			)
+			continue
+		}
+
+		resolved := resolveAssetLabelAssignability(ctx, checker, apiLabel, label)
+
+		if resolved.ReadOnly != nil && *resolved.ReadOnly {
+			diags.AddError(
+				"Invalid Asset Label Reference",
+				fmt.Sprintf("Label %q referenced in %s is system-managed (`read_only = true`) and cannot be assigned in guardicore_asset.labels. Use a directly assignable label.", labelID, location),
+			)
+			continue
+		}
+
+		if len(resolved.DynamicCriteria) > 0 {
+			diags.AddError(
+				"Invalid Asset Label Reference",
+				fmt.Sprintf("Label %q referenced in %s has dynamic criteria and cannot be manually assigned in guardicore_asset.labels. Remove it from labels and let the platform assign it dynamically.", labelID, location),
+			)
+		}
 	}
 
 	return diags
+}
+
+func resolveAssetLabelAssignability(ctx context.Context, checker ReferenceChecker, apiLabel *client.Label, modelLabel AssetLabelModel) *client.Label {
+	if apiLabel == nil {
+		return nil
+	}
+
+	if apiLabel.ReadOnly != nil || len(apiLabel.DynamicCriteria) > 0 {
+		return apiLabel
+	}
+
+	key := apiLabel.Key
+	value := apiLabel.Value
+	if key == "" && !modelLabel.Key.IsNull() && !modelLabel.Key.IsUnknown() {
+		key = modelLabel.Key.ValueString()
+	}
+	if value == "" && !modelLabel.Value.IsNull() && !modelLabel.Value.IsUnknown() {
+		value = modelLabel.Value.ValueString()
+	}
+	if key == "" || value == "" {
+		return apiLabel
+	}
+
+	labels, err := checker.ListLabels(ctx, key, value)
+	if err != nil {
+		return apiLabel
+	}
+
+	for _, candidate := range labels {
+		if candidate.ID == apiLabel.ID {
+			resolved := *apiLabel
+			if resolved.ReadOnly == nil {
+				resolved.ReadOnly = candidate.ReadOnly
+			}
+			if len(resolved.DynamicCriteria) == 0 && len(candidate.DynamicCriteria) > 0 {
+				resolved.DynamicCriteria = candidate.DynamicCriteria
+			}
+			return &resolved
+		}
+	}
+
+	return apiLabel
 }
 
 // validatePolicyGroupExists checks if a policy group ID exists in Akamai Guardicore Segmentation.

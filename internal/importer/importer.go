@@ -29,25 +29,184 @@ type Importer struct {
 
 // Result contains a summary of the import operation.
 type Result struct {
-	Labels        int
-	LabelGroups   int
-	PolicyRules   int
-	DnsBlocklists int
-	Incidents     int
-	Worksites     int
-	UserGroups    int
-	Assets        int
+	Labels           int
+	LabelGroups      int
+	PolicyRules      int
+	DnsBlocklists    int
+	Incidents        int
+	Worksites        int
+	UserGroups       int
+	Assets           int
+	AgentAggregators int
 }
 
 // ResourceLookup maps API IDs to Terraform resource reference expressions.
-// Values are HCL expressions like "guardicore_label.env_prod.id".
+// Values are HCL expressions like "guardicore_label.env_prod.id" for managed
+// resources, or "data.guardicore_label.env_prod.id" for system-managed data sources.
 type ResourceLookup struct {
-	Labels       map[string]string // API ID → "guardicore_label.<name>.id"
+	Labels       map[string]string // API ID → "guardicore_label.<name>.id" or "data.guardicore_label.<name>.id"
 	LabelGroups  map[string]string // API ID → "guardicore_label_group.<name>.id"
 	PolicyGroups map[string]string // API ID → "guardicore_policy_group.<name>.id"
-	UserGroups   map[string]string // API ID → "guardicore_user_group.<name>.id"
+	UserGroups   map[string]string // API ID → "guardicore_user_group.<name>.id" or "data.guardicore_user_group.<name>.id"
 	Assets       map[string]string // API ID → "guardicore_asset.<name>.id"
 	Worksites    map[string]string // API ID → "guardicore_worksite.<name>.id"
+}
+
+type assetLabelAssignabilityStatus int
+
+const (
+	assetLabelAssignabilityUnknown assetLabelAssignabilityStatus = iota
+	assetLabelAssignable
+	assetLabelNonAssignable
+)
+
+type assetLabelAssignabilityResult struct {
+	Status  assetLabelAssignabilityStatus
+	Reason  string
+	Warning string
+}
+
+func nonAssignableReasonForLabel(label client.Label) string {
+	readOnly := label.ReadOnly != nil && *label.ReadOnly
+	dynamic := len(label.DynamicCriteria) > 0
+
+	switch {
+	case readOnly && dynamic:
+		return "read-only and dynamic"
+	case readOnly:
+		return "read-only"
+	case dynamic:
+		return "dynamic"
+	default:
+		return ""
+	}
+}
+
+func buildNonAssignableAssetLabelReasons(labels []client.Label) map[string]string {
+	reasons := make(map[string]string)
+	for _, label := range labels {
+		if reason := nonAssignableReasonForLabel(label); reason != "" {
+			reasons[label.ID] = reason
+		}
+	}
+	return reasons
+}
+
+func buildExplicitAssignableAssetLabelIDs(labels []client.Label) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, label := range labels {
+		if label.ReadOnly != nil && !*label.ReadOnly && len(label.DynamicCriteria) == 0 {
+			ids[label.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func (imp *Importer) resolveAssetLabelAssignability(
+	ctx context.Context,
+	label client.AssetLabelRef,
+	nonAssignableLabelReasons map[string]string,
+	explicitAssignableLabelIDs map[string]struct{},
+	cache map[string]assetLabelAssignabilityResult,
+) assetLabelAssignabilityResult {
+	labelID := label.ID
+	if labelID == "" {
+		return assetLabelAssignabilityResult{Status: assetLabelAssignabilityUnknown}
+	}
+
+	if result, ok := cache[labelID]; ok {
+		return result
+	}
+
+	if reason, ok := nonAssignableLabelReasons[labelID]; ok {
+		result := assetLabelAssignabilityResult{Status: assetLabelNonAssignable, Reason: reason}
+		cache[labelID] = result
+		return result
+	}
+
+	if _, ok := explicitAssignableLabelIDs[labelID]; ok {
+		result := assetLabelAssignabilityResult{Status: assetLabelAssignable}
+		cache[labelID] = result
+		return result
+	}
+
+	if imp.Client == nil {
+		result := assetLabelAssignabilityResult{
+			Status:  assetLabelAssignabilityUnknown,
+			Warning: "labels API client is not configured",
+		}
+		cache[labelID] = result
+		return result
+	}
+
+	apiLabel, err := imp.Client.GetLabel(ctx, labelID)
+	if err != nil {
+		result := assetLabelAssignabilityResult{
+			Status:  assetLabelAssignabilityUnknown,
+			Warning: fmt.Sprintf("failed to read label %q from labels API: %s", labelID, err),
+		}
+		cache[labelID] = result
+		return result
+	}
+
+	if apiLabel == nil {
+		result := assetLabelAssignabilityResult{
+			Status:  assetLabelAssignabilityUnknown,
+			Warning: fmt.Sprintf("label %q was not found in labels API", labelID),
+		}
+		cache[labelID] = result
+		return result
+	}
+
+	key := apiLabel.Key
+	if key == "" {
+		key = label.Key
+	}
+	value := apiLabel.Value
+	if value == "" {
+		value = label.Value
+	}
+
+	if key == "" || value == "" {
+		result := assetLabelAssignabilityResult{
+			Status:  assetLabelAssignabilityUnknown,
+			Warning: fmt.Sprintf("label %q is missing key/value metadata for assignability checks", labelID),
+		}
+		cache[labelID] = result
+		return result
+	}
+
+	labels, err := imp.Client.ListLabels(ctx, key, value)
+	if err != nil {
+		result := assetLabelAssignabilityResult{
+			Status:  assetLabelAssignabilityUnknown,
+			Warning: fmt.Sprintf("failed to list labels for %q/%q while verifying label %q: %s", key, value, labelID, err),
+		}
+		cache[labelID] = result
+		return result
+	}
+
+	for _, candidate := range labels {
+		if candidate.ID != labelID {
+			continue
+		}
+		if reason := nonAssignableReasonForLabel(candidate); reason != "" {
+			result := assetLabelAssignabilityResult{Status: assetLabelNonAssignable, Reason: reason}
+			cache[labelID] = result
+			return result
+		}
+
+		result := assetLabelAssignabilityResult{Status: assetLabelAssignable}
+		cache[labelID] = result
+		return result
+	}
+
+	result := assetLabelAssignabilityResult{
+		Status:  assetLabelAssignabilityUnknown,
+		Warning: fmt.Sprintf("label %q was not returned by labels API lookup for key=%q value=%q", labelID, key, value),
+	}
+	cache[labelID] = result
+	return result
 }
 
 // buildLookupMap converts a list of named resources into ID-to-reference map.
@@ -59,12 +218,56 @@ func buildLookupMap(named []NamedResource, resourceType string) map[string]strin
 	return m
 }
 
+// buildLookupMapSplit builds a lookup map where system-managed resources use
+// data source references and managed resources use resource references.
+func buildLookupMapSplit(named []NamedResource, resourceType string, systemManagedIDs map[string]struct{}) map[string]string {
+	m := make(map[string]string, len(named))
+	for _, nr := range named {
+		if _, isSM := systemManagedIDs[nr.ID]; isSM {
+			m[nr.ID] = fmt.Sprintf("data.%s.%s.id", resourceType, nr.Name)
+		} else {
+			m[nr.ID] = fmt.Sprintf("%s.%s.id", resourceType, nr.Name)
+		}
+	}
+	return m
+}
+
+func filterImportableAssets(assets []client.Asset) ([]client.Asset, int) {
+	filtered := make([]client.Asset, 0, len(assets))
+	skipped := 0
+	for _, asset := range assets {
+		if strings.EqualFold(asset.Status, "deleted") {
+			skipped++
+			continue
+		}
+		filtered = append(filtered, asset)
+	}
+	return filtered, skipped
+}
+
+func partitionLabels(labels []client.Label) (manageable, systemManaged []client.Label) {
+	for _, label := range labels {
+		if label.ReadOnly != nil && *label.ReadOnly {
+			systemManaged = append(systemManaged, label)
+		} else {
+			manageable = append(manageable, label)
+		}
+	}
+	return
+}
+
 // Run fetches all resources and writes .tf files to the output directory.
 func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	// Phase 1: Fetch all resources
 	labels, err := imp.Client.ListLabels(ctx, "", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list labels: %w", err)
+	}
+	nonAssignableAssetLabelReasons := buildNonAssignableAssetLabelReasons(labels)
+	explicitAssignableAssetLabelIDs := buildExplicitAssignableAssetLabelIDs(labels)
+	manageableLabels, systemManagedLabels := partitionLabels(labels)
+	if len(systemManagedLabels) > 0 {
+		fmt.Fprintf(os.Stderr, "Note: %d read-only labels will be generated as data sources\n", len(systemManagedLabels))
 	}
 
 	labelGroups, err := imp.Client.ListLabelGroups(ctx, "", "")
@@ -78,7 +281,10 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	}
 
 	dnsBlocklists, err := imp.Client.ListDnsBlocklists(ctx, "", "")
-	if err != nil {
+	if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+		fmt.Fprintln(os.Stderr, "Note: DNS Security feature is disabled, skipping DNS blocklists import")
+		dnsBlocklists = nil
+	} else if err != nil {
 		return nil, fmt.Errorf("failed to list DNS blocklists: %w", err)
 	}
 
@@ -104,13 +310,28 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to list assets: %w", err)
 	}
+	assets, skippedDeletedAssets := filterImportableAssets(assets)
+	if skippedDeletedAssets > 0 {
+		fmt.Fprintf(os.Stderr, "Note: skipping %d deleted assets; Terraform treats deactivated assets as removed\n", skippedDeletedAssets)
+	}
+
+	agentAggregators, err := imp.Client.ListAgentAggregators(ctx, "")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list agent aggregators: %w", err)
+	}
 
 	// Phase 2: Build name maps and deduplicate
-	labelIDToName := make(map[string]string, len(labels))
-	for _, l := range labels {
+	allLabels := append(manageableLabels, systemManagedLabels...)
+	labelIDToName := make(map[string]string, len(allLabels))
+	for _, l := range allLabels {
 		labelIDToName[l.ID] = SanitizeName(l.Key, l.Value)
 	}
 	namedLabels := DeduplicateNames(labelIDToName)
+
+	systemManagedLabelIDs := make(map[string]struct{}, len(systemManagedLabels))
+	for _, l := range systemManagedLabels {
+		systemManagedLabelIDs[l.ID] = struct{}{}
+	}
 
 	labelGroupIDToName := make(map[string]string, len(labelGroups))
 	for _, g := range labelGroups {
@@ -119,8 +340,12 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	namedLabelGroups := DeduplicateNames(labelGroupIDToName)
 
 	userGroupIDToName := make(map[string]string, len(userGroups))
+	systemManagedUGIDs := make(map[string]struct{})
 	for _, ug := range userGroups {
 		userGroupIDToName[ug.ID] = SanitizeName("", ug.Title)
+		if shouldSkipUserGroup(ug) {
+			systemManagedUGIDs[ug.ID] = struct{}{}
+		}
 	}
 	namedUserGroups := DeduplicateNames(userGroupIDToName)
 
@@ -131,19 +356,23 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	namedAssets := DeduplicateNames(assetIDToName)
 
 	worksiteIDToName := make(map[string]string, len(worksites))
+	systemManagedWorksiteIDs := make(map[string]struct{})
 	for _, w := range worksites {
 		worksiteIDToName[w.ID] = SanitizeName("", w.Name)
+		if w.Name == "Default" {
+			systemManagedWorksiteIDs[w.ID] = struct{}{}
+		}
 	}
 	namedWorksites := DeduplicateNames(worksiteIDToName)
 
 	// Build global resource lookup for cross-references
 	lookup := &ResourceLookup{
-		Labels:       buildLookupMap(namedLabels, "guardicore_label"),
+		Labels:       buildLookupMapSplit(namedLabels, "guardicore_label", systemManagedLabelIDs),
 		LabelGroups:  buildLookupMap(namedLabelGroups, "guardicore_label_group"),
 		PolicyGroups: map[string]string{},
-		UserGroups:   buildLookupMap(namedUserGroups, "guardicore_user_group"),
+		UserGroups:   buildLookupMapSplit(namedUserGroups, "guardicore_user_group", systemManagedUGIDs),
 		Assets:       buildLookupMap(namedAssets, "guardicore_asset"),
-		Worksites:    buildLookupMap(namedWorksites, "guardicore_worksite"),
+		Worksites:    buildLookupMapSplit(namedWorksites, "guardicore_worksite", systemManagedWorksiteIDs),
 	}
 
 	// Phase 3: Generate files
@@ -151,7 +380,7 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	if err := imp.generateLabelsFile(labels, namedLabels); err != nil {
+	if err := imp.generateLabelsFile(allLabels, namedLabels, systemManagedLabelIDs); err != nil {
 		return nil, fmt.Errorf("failed to generate labels.tf: %w", err)
 	}
 
@@ -171,32 +400,38 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("failed to generate incidents.tf: %w", err)
 	}
 
-	if err := imp.generateWorksitesFile(worksites); err != nil {
+	if err := imp.generateWorksitesFile(worksites, namedWorksites, systemManagedWorksiteIDs); err != nil {
 		return nil, fmt.Errorf("failed to generate worksites.tf: %w", err)
 	}
 
-	userGroupsWritten, err := imp.generateUserGroupsFile(userGroups, namedUserGroups)
+	userGroupsWritten, err := imp.generateUserGroupsFile(userGroups, namedUserGroups, systemManagedUGIDs)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate user_groups.tf: %w", err)
 	}
 
-	if err := imp.generateAssetsFile(assets, namedAssets, lookup); err != nil {
+	assetsWritten, err := imp.generateAssetsFile(ctx, assets, namedAssets, lookup, nonAssignableAssetLabelReasons, explicitAssignableAssetLabelIDs)
+	if err != nil {
 		return nil, fmt.Errorf("failed to generate assets.tf: %w", err)
 	}
 
+	if err := imp.generateAgentAggregatorsFile(agentAggregators); err != nil {
+		return nil, fmt.Errorf("failed to generate agent_aggregators.tf: %w", err)
+	}
+
 	return &Result{
-		Labels:        len(labels),
-		LabelGroups:   len(labelGroups),
-		PolicyRules:   len(policyRules),
-		DnsBlocklists: len(dnsBlocklists),
-		Incidents:     len(incidents),
-		Worksites:     len(worksites),
-		UserGroups:    userGroupsWritten,
-		Assets:        len(assets),
+		Labels:           len(allLabels),
+		LabelGroups:      len(labelGroups),
+		PolicyRules:      len(policyRules),
+		DnsBlocklists:    len(dnsBlocklists),
+		Incidents:        len(incidents),
+		Worksites:        len(worksites),
+		UserGroups:       userGroupsWritten,
+		Assets:           assetsWritten,
+		AgentAggregators: len(agentAggregators),
 	}, nil
 }
 
-func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedResource) error {
+func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedResource, systemManagedIDs map[string]struct{}) error {
 	labelByID := make(map[string]client.Label, len(labels))
 	for _, l := range labels {
 		labelByID[l.ID] = l
@@ -206,25 +441,66 @@ func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedReso
 	for i, nr := range named {
 		l := labelByID[nr.ID]
 
-		var criteria []CriteriaData
-		for _, c := range l.DynamicCriteria {
-			criteria = append(criteria, CriteriaData{
-				Field:    c.Field,
-				Op:       c.Op,
-				Argument: c.Argument,
-			})
-		}
+		if _, isSM := systemManagedIDs[nr.ID]; isSM {
+			data := LabelTemplateData{
+				Name:  nr.Name,
+				Key:   l.Key,
+				Value: l.Value,
+			}
+			if err := labelDataTemplate.Execute(&buf, data); err != nil {
+				return fmt.Errorf("failed to render data label %s: %w", l.ID, err)
+			}
+		} else {
+			var criteria []CriteriaData
+			for _, c := range l.DynamicCriteria {
+				if c.IsReadOnlyWorksiteGenerated() {
+					continue
+				}
 
-		data := LabelTemplateData{
-			Name:     nr.Name,
-			ID:       l.ID,
-			Key:      l.Key,
-			Value:    l.Value,
-			Criteria: criteria,
-		}
+				if len(c.CompoundCriteria) > 0 {
+					compound := make([]CompoundCriteriaData, 0, len(c.CompoundCriteria))
+					for _, cc := range c.CompoundCriteria {
+						if cc.Field == "" || cc.Op == "" || cc.Argument == "" {
+							return fmt.Errorf("label %q/%q (%s) has invalid compound dynamic criterion with empty required fields", l.Key, l.Value, l.ID)
+						}
+						compound = append(compound, CompoundCriteriaData{
+							Field:    cc.Field,
+							Op:       cc.Op,
+							Argument: cc.Argument,
+						})
+					}
+					if len(compound) == 0 {
+						return fmt.Errorf("label %q/%q (%s) has empty compound dynamic criterion", l.Key, l.Value, l.ID)
+					}
+					criteria = append(criteria, CriteriaData{
+						IsCompound:       true,
+						CompoundCriteria: compound,
+					})
+					continue
+				}
 
-		if err := labelTemplate.Execute(&buf, data); err != nil {
-			return fmt.Errorf("failed to render label %s: %w", l.ID, err)
+				if c.Field == "" || c.Op == "" || c.Argument == "" {
+					return fmt.Errorf("label %q/%q (%s) has unsupported or incomplete dynamic criterion: expected either flat field/op/argument or compound_criteria", l.Key, l.Value, l.ID)
+				}
+				criteria = append(criteria, CriteriaData{
+					Field:      c.Field,
+					Op:         c.Op,
+					Argument:   c.Argument,
+					IsCompound: false,
+				})
+			}
+
+			data := LabelTemplateData{
+				Name:     nr.Name,
+				ID:       l.ID,
+				Key:      l.Key,
+				Value:    l.Value,
+				Criteria: criteria,
+			}
+
+			if err := labelTemplate.Execute(&buf, data); err != nil {
+				return fmt.Errorf("failed to render label %s: %w", l.ID, err)
+			}
 		}
 		if i < len(named)-1 {
 			buf.WriteString("\n")
@@ -279,19 +555,35 @@ func buildLabelGroupSelectorHCL(read *client.OrLabelsRead, lookup *ResourceLooku
 	buf.WriteString("    or_groups = [\n")
 	for i, or := range read.OrLabels {
 		buf.WriteString("      {\n")
-		buf.WriteString("        label_ids = [")
-		for j, label := range or.AndLabels {
-			if j > 0 {
-				buf.WriteString(", ")
-			}
-			if ref, ok := lookup.Labels[label.ID]; ok {
-				buf.WriteString(ref)
-			} else {
-				fmt.Fprintf(&buf, "%q", label.ID)
-				buf.WriteString(" # reference not imported")
+
+		hasUnresolved := false
+		for _, label := range or.AndLabels {
+			if _, ok := lookup.Labels[label.ID]; !ok {
+				hasUnresolved = true
+				break
 			}
 		}
-		buf.WriteString("]\n")
+
+		if hasUnresolved {
+			buf.WriteString("        label_ids = [\n")
+			for _, label := range or.AndLabels {
+				if ref, ok := lookup.Labels[label.ID]; ok {
+					fmt.Fprintf(&buf, "          %s,\n", ref)
+				} else {
+					fmt.Fprintf(&buf, "          %q, # reference not imported\n", label.ID)
+				}
+			}
+			buf.WriteString("        ]\n")
+		} else {
+			buf.WriteString("        label_ids = [")
+			for j, label := range or.AndLabels {
+				if j > 0 {
+					buf.WriteString(", ")
+				}
+				buf.WriteString(lookup.Labels[label.ID])
+			}
+			buf.WriteString("]\n")
+		}
 		buf.WriteString("      }")
 		if i < len(read.OrLabels)-1 {
 			buf.WriteString(",")
@@ -378,6 +670,17 @@ func (imp *Importer) generateDnsSecurityFile(blocklists []client.DnsBlocklist) e
 	for i, nr := range named {
 		b := blocklistByID[nr.ID]
 
+		if isSystemManagedDnsBlocklistType(b.Type) {
+			fmt.Fprintf(os.Stderr, "Note: system-managed DNS blocklist %q (%s, type=%s) will be generated as data source\n", b.Name, b.ID, b.Type)
+			if err := dnsSecurityDataTemplate.Execute(&buf, DnsSecurityTemplateData{Name: nr.Name, ID: b.ID}); err != nil {
+				return fmt.Errorf("failed to render DNS blocklist data source %s: %w", b.ID, err)
+			}
+			if i < len(named)-1 {
+				buf.WriteString("\n")
+			}
+			continue
+		}
+
 		data := DnsSecurityTemplateData{
 			Name:         nr.Name,
 			ID:           b.ID,
@@ -396,6 +699,10 @@ func (imp *Importer) generateDnsSecurityFile(blocklists []client.DnsBlocklist) e
 	}
 
 	return os.WriteFile(filepath.Join(imp.OutputDir, "dns_security.tf"), buf.Bytes(), 0644)
+}
+
+func isSystemManagedDnsBlocklistType(listType string) bool {
+	return strings.EqualFold(listType, "AKAMAI_INTELLIGENCE") || strings.EqualFold(listType, "WEB_CATEGORY")
 }
 
 func (imp *Importer) generateIncidentsFile(incidents []map[string]interface{}) error {
@@ -482,13 +789,14 @@ func commentAllLines(value, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-func (imp *Importer) generateWorksitesFile(worksites []client.Worksite) error {
-	idToName := make(map[string]string, len(worksites))
-	for _, w := range worksites {
-		idToName[w.ID] = SanitizeName("", w.Name)
+func formatOptionalHCLString(value string) string {
+	if value == "" {
+		return ""
 	}
-	named := DeduplicateNames(idToName)
+	return formatHCLScalar(value)
+}
 
+func (imp *Importer) generateWorksitesFile(worksites []client.Worksite, named []NamedResource, systemManagedIDs map[string]struct{}) error {
 	worksiteByID := make(map[string]client.Worksite, len(worksites))
 	for _, w := range worksites {
 		worksiteByID[w.ID] = w
@@ -499,14 +807,21 @@ func (imp *Importer) generateWorksitesFile(worksites []client.Worksite) error {
 		w := worksiteByID[nr.ID]
 
 		data := WorksiteTemplateData{
-			Name:         nr.Name,
-			ID:           w.ID,
-			ResourceName: w.Name,
-			Comment:      w.Comment,
+			Name:            nr.Name,
+			ID:              w.ID,
+			ResourceNameHCL: formatHCLScalar(w.Name),
+			CommentHCL:      formatOptionalHCLString(w.Comment),
 		}
 
-		if err := worksiteTemplate.Execute(&buf, data); err != nil {
-			return fmt.Errorf("failed to render worksite %s: %w", w.ID, err)
+		if _, isSM := systemManagedIDs[nr.ID]; isSM {
+			fmt.Fprintf(os.Stderr, "Note: system-managed worksite %q (%s) will be generated as data source\n", w.Name, nr.Name)
+			if err := worksiteDataTemplate.Execute(&buf, data); err != nil {
+				return fmt.Errorf("failed to render worksite data source %s: %w", w.ID, err)
+			}
+		} else {
+			if err := worksiteTemplate.Execute(&buf, data); err != nil {
+				return fmt.Errorf("failed to render worksite %s: %w", w.ID, err)
+			}
 		}
 		if i < len(named)-1 {
 			buf.WriteString("\n")
@@ -516,7 +831,7 @@ func (imp *Importer) generateWorksitesFile(worksites []client.Worksite) error {
 	return os.WriteFile(filepath.Join(imp.OutputDir, "worksites.tf"), buf.Bytes(), 0644)
 }
 
-func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named []NamedResource) (int, error) {
+func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named []NamedResource, systemManagedIDs map[string]struct{}) (int, error) {
 	userGroupByID := make(map[string]client.UserGroup, len(userGroups))
 	for _, ug := range userGroups {
 		userGroupByID[ug.ID] = ug
@@ -527,19 +842,23 @@ func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named
 	for _, nr := range named {
 		ug := userGroupByID[nr.ID]
 
-		var orchGroups []OrchestrationGroupData
-		for _, og := range ug.OrchestrationsGroups {
-			orchGroups = append(orchGroups, OrchestrationGroupData{
-				OrchestrationID: og.OrchestrationID,
-				Groups:          og.Groups,
-			})
-		}
-
-		// Skip user groups with no orchestration groups — schema requires at least one.
-		if len(orchGroups) == 0 {
-			fmt.Fprintf(os.Stderr, "Note: skipping user group %q (%s): no orchestration groups\n", ug.Title, ug.ID)
+		if _, isSM := systemManagedIDs[nr.ID]; isSM {
+			fmt.Fprintf(os.Stderr, "Note: system-managed user group %q (%s) will be generated as data source\n", ug.Title, ug.ID)
+			if buf.Len() > 0 {
+				buf.WriteString("\n")
+			}
+			data := UserGroupTemplateData{
+				Name:  nr.Name,
+				Title: ug.Title,
+			}
+			if err := userGroupDataTemplate.Execute(&buf, data); err != nil {
+				return 0, fmt.Errorf("failed to render data user group %s: %w", ug.ID, err)
+			}
+			written++
 			continue
 		}
+
+		orchGroups := orchGroupsFromUserGroup(ug)
 
 		data := UserGroupTemplateData{
 			Name:                 nr.Name,
@@ -548,11 +867,11 @@ func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named
 			OrchestrationsGroups: orchGroups,
 		}
 
+		if buf.Len() > 0 {
+			buf.WriteString("\n")
+		}
 		if err := userGroupTemplate.Execute(&buf, data); err != nil {
 			return 0, fmt.Errorf("failed to render user group %s: %w", ug.ID, err)
-		}
-		if written > 0 {
-			buf.WriteString("\n")
 		}
 		written++
 	}
@@ -560,18 +879,124 @@ func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named
 	return written, os.WriteFile(filepath.Join(imp.OutputDir, "user_groups.tf"), buf.Bytes(), 0644)
 }
 
-func (imp *Importer) generateAssetsFile(assets []client.Asset, named []NamedResource, lookup *ResourceLookup) error {
+// shouldSkipUserGroup returns true if a user group should be skipped during import.
+// System user groups (e.g., "Local Administrators") have all orchestration IDs set to "local".
+func shouldSkipUserGroup(ug client.UserGroup) bool {
+	if len(ug.GroupsByDomainName) > 0 {
+		for _, domainInfo := range ug.GroupsByDomainName {
+			if domainInfo.OrchestrationID != "local" {
+				return false
+			}
+		}
+		return true
+	}
+
+	if len(ug.OrchestrationsGroups) > 0 {
+		for _, og := range ug.OrchestrationsGroups {
+			if og.OrchestrationID != "local" {
+				return false
+			}
+		}
+		return true
+	}
+
+	return true
+}
+
+// orchGroupsFromUserGroup extracts OrchestrationGroupData from a UserGroup,
+// preferring GroupsByDomainName (list API format) over OrchestrationsGroups (create API format).
+func orchGroupsFromUserGroup(ug client.UserGroup) []OrchestrationGroupData {
+	if len(ug.GroupsByDomainName) > 0 {
+		var result []OrchestrationGroupData
+		for _, domainInfo := range ug.GroupsByDomainName {
+			var groupIDs []string
+			for _, g := range domainInfo.Groups {
+				groupIDs = append(groupIDs, g.ID)
+			}
+			result = append(result, OrchestrationGroupData{
+				OrchestrationID: domainInfo.OrchestrationID,
+				Groups:          groupIDs,
+			})
+		}
+		return result
+	}
+
+	var result []OrchestrationGroupData
+	for _, og := range ug.OrchestrationsGroups {
+		result = append(result, OrchestrationGroupData{
+			OrchestrationID: og.OrchestrationID,
+			Groups:          og.Groups,
+		})
+	}
+	return result
+}
+
+func shouldSkipAsset(a client.Asset) bool {
+	if len(a.Nics) == 0 {
+		return true
+	}
+	for _, nic := range a.Nics {
+		if len(nic.IPAddresses) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (imp *Importer) generateAssetsFile(
+	ctx context.Context,
+	assets []client.Asset,
+	named []NamedResource,
+	lookup *ResourceLookup,
+	nonAssignableLabelReasons map[string]string,
+	explicitAssignableLabelIDs map[string]struct{},
+) (int, error) {
 	assetByID := make(map[string]client.Asset, len(assets))
 	for _, a := range assets {
 		assetByID[a.ID] = a
 	}
 
+	assignabilityCache := make(map[string]assetLabelAssignabilityResult)
+
 	var buf bytes.Buffer
-	for i, nr := range named {
+	written := 0
+	for _, nr := range named {
 		a := assetByID[nr.ID]
+
+		if shouldSkipAsset(a) {
+			fmt.Fprintf(os.Stderr, "Note: skipping asset %q (%s): no valid NICs (all NICs have empty ip_addresses or none exist)\n", a.Name, a.ID)
+			if buf.Len() > 0 {
+				buf.WriteString("\n")
+			}
+			orchObjID := ""
+			if len(a.OrchestrationDetails) > 0 && a.OrchestrationDetails[0].OrchestrationObjID != "" {
+				orchObjID = a.OrchestrationDetails[0].OrchestrationObjID
+			}
+			if orchObjID == "" {
+				orchObjID = a.OrchestrationObjID
+			}
+			if orchObjID == "" {
+				orchObjID = orchObjIDPlaceholder
+			}
+			data := AssetTemplateData{
+				Name:               nr.Name,
+				ID:                 a.ID,
+				ResourceName:       a.Name,
+				OrchestrationObjID: orchObjID,
+			}
+			if err := assetSkippedTemplate.Execute(&buf, data); err != nil {
+				return 0, fmt.Errorf("failed to render skipped asset %s: %w", a.ID, err)
+			}
+			continue
+		}
 
 		var nics []AssetNICData
 		for _, nic := range a.Nics {
+			if len(nic.IPAddresses) == 0 {
+				fmt.Fprintf(os.Stderr, "Note: skipping NIC (MAC: %s) on asset %q (%s): empty ip_addresses\n",
+					nic.MacAddress, a.Name, a.ID)
+				continue
+			}
 			nics = append(nics, AssetNICData{
 				IPAddresses: nic.IPAddresses,
 				MacAddress:  nic.MacAddress,
@@ -582,25 +1007,75 @@ func (imp *Importer) generateAssetsFile(assets []client.Asset, named []NamedReso
 
 		var labelRefs []AssetLabelRefData
 		for _, label := range a.Labels {
+			assignability := imp.resolveAssetLabelAssignability(
+				ctx,
+				label,
+				nonAssignableLabelReasons,
+				explicitAssignableLabelIDs,
+				assignabilityCache,
+			)
+
+			if assignability.Status == assetLabelNonAssignable {
+				fmt.Fprintf(
+					os.Stderr,
+					"Note: skipping non-assignable asset label %q on asset %q (%s): %s label\n",
+					label.ID,
+					a.Name,
+					a.ID,
+					assignability.Reason,
+				)
+				continue
+			}
+
 			refData := AssetLabelRefData{}
 			if ref, ok := lookup.Labels[label.ID]; ok {
-				// Derive .id, .key, and .value references from the lookup
 				base := strings.TrimSuffix(ref, ".id")
 				refData.IDExpression = ref
 				refData.KeyExpression = base + ".key"
 				refData.ValueExpression = base + ".value"
 			} else {
-				// Fallback to quoted literals
-				if label.ID != "" {
-					refData.IDExpression = fmt.Sprintf("%q", label.ID)
+				if label.ID == "" || label.Key == "" || label.Value == "" {
+					if assignability.Status == assetLabelAssignabilityUnknown {
+						fmt.Fprintf(
+							os.Stderr,
+							"Note: skipping unresolved asset label %q on asset %q (%s): missing key/value and no managed label reference exists\n",
+							label.ID,
+							a.Name,
+							a.ID,
+						)
+					}
+					fmt.Fprintf(
+						os.Stderr,
+						"Note: skipping asset label %q on asset %q (%s): label details are incomplete and no managed label reference exists\n",
+						label.ID,
+						a.Name,
+						a.ID,
+					)
+					continue
 				}
+
+				refData.IDExpression = fmt.Sprintf("%q", label.ID)
 				refData.KeyExpression = fmt.Sprintf("%q", label.Key)
 				refData.ValueExpression = fmt.Sprintf("%q", label.Value)
+			}
+
+			if assignability.Status == assetLabelAssignabilityUnknown {
+				warning := assignability.Warning
+				if warning == "" {
+					warning = "label assignability could not be verified"
+				}
+				fmt.Fprintf(
+					os.Stderr,
+					"Note: unable to verify assignability for asset label %q on asset %q (%s): %s; including label as-is. If this label is read-only or dynamic, apply may fail.\n",
+					label.ID,
+					a.Name,
+					a.ID,
+					warning,
+				)
 			}
 			labelRefs = append(labelRefs, refData)
 		}
 
-		// Resolve worksite reference
 		var worksiteExpr string
 		if a.ScopingDetails != nil && a.ScopingDetails.Worksite != nil && a.ScopingDetails.Worksite.ID != "" {
 			wsID := a.ScopingDetails.Worksite.ID
@@ -611,8 +1086,6 @@ func (imp *Importer) generateAssetsFile(assets []client.Asset, named []NamedReso
 			}
 		}
 
-		// orchestration_obj_id is nested inside orchestration_details[] in the API response.
-		// Fall back to the top-level field (may exist in some API versions), then to a placeholder.
 		orchObjID := ""
 		if len(a.OrchestrationDetails) > 0 && a.OrchestrationDetails[0].OrchestrationObjID != "" {
 			orchObjID = a.OrchestrationDetails[0].OrchestrationObjID
@@ -634,7 +1107,6 @@ func (imp *Importer) generateAssetsFile(assets []client.Asset, named []NamedReso
 			OrchObjIDComment:   orchObjIDComment,
 			InstanceID:         a.InstanceID,
 			HwUUID:             a.HwUUID,
-			BiosUUID:           a.BiosUUID,
 			Comments:           a.Comments,
 			Status:             a.Status,
 			Nics:               nics,
@@ -643,14 +1115,15 @@ func (imp *Importer) generateAssetsFile(assets []client.Asset, named []NamedReso
 		}
 
 		if err := assetTemplate.Execute(&buf, data); err != nil {
-			return fmt.Errorf("failed to render asset %s: %w", a.ID, err)
+			return 0, fmt.Errorf("failed to render asset %s: %w", a.ID, err)
 		}
-		if i < len(named)-1 {
+		if written > 0 {
 			buf.WriteString("\n")
 		}
+		written++
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "assets.tf"), buf.Bytes(), 0644)
+	return written, os.WriteFile(filepath.Join(imp.OutputDir, "assets.tf"), buf.Bytes(), 0644)
 }
 
 // buildPolicyRuleBodyHCL generates typed HCL attributes for a policy rule,
@@ -659,6 +1132,8 @@ func buildPolicyRuleBodyHCL(spec map[string]interface{}, lookup *ResourceLookup)
 	if spec == nil {
 		return ""
 	}
+
+	normalizePolicyRuleICMPMatches(spec)
 
 	// Replace IDs with references in source/destination endpoints
 	for _, endpointKey := range []string{"source", "destination"} {
@@ -721,6 +1196,7 @@ func buildPolicyRuleBodyHCL(spec map[string]interface{}, lookup *ResourceLookup)
 		}
 	}
 	delete(spec, "recently_hit")
+	delete(spec, "creation_origin")
 
 	if len(spec) > 0 {
 		rawJSON, err := json.MarshalIndent(spec, "  ", "  ")
@@ -737,6 +1213,35 @@ func buildPolicyRuleBodyHCL(spec map[string]interface{}, lookup *ResourceLookup)
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+func normalizePolicyRuleICMPMatches(spec map[string]interface{}) {
+	rawMatches, ok := spec["icmp_matches"]
+	if !ok {
+		return
+	}
+
+	matches, ok := rawMatches.([]interface{})
+	if !ok {
+		return
+	}
+
+	for _, rawMatch := range matches {
+		match, ok := rawMatch.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		rawCodes, hasCodes := match["icmp_codes"]
+		if !hasCodes {
+			match["icmp_codes"] = []interface{}{}
+			continue
+		}
+
+		if _, ok := rawCodes.([]interface{}); !ok {
+			match["icmp_codes"] = []interface{}{}
+		}
+	}
 }
 
 // replaceEndpointRefs replaces string IDs in an endpoint's reference array
@@ -778,15 +1283,29 @@ func replaceNestedLabelRefs(endpointMap map[string]interface{}, refMap map[strin
 			continue
 		}
 		for i, rawLabelID := range andLabels {
-			labelID, ok := rawLabelID.(string)
-			if !ok {
+			labelID := labelIDFromPolicyRuleEndpoint(rawLabelID)
+			if labelID == "" {
 				continue
 			}
 			if tfRef, found := refMap[labelID]; found {
 				andLabels[i] = tfRef
+			} else {
+				andLabels[i] = labelID
 			}
 		}
 	}
+}
+
+func labelIDFromPolicyRuleEndpoint(value interface{}) string {
+	if labelID, ok := value.(string); ok {
+		return labelID
+	}
+	label, ok := value.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	labelID, _ := label["id"].(string)
+	return labelID
 }
 
 func formatHCLObject(value map[string]interface{}, indent int) string {
@@ -797,7 +1316,7 @@ func formatHCLValue(value interface{}, indent int) string {
 	padding := strings.Repeat("  ", indent)
 	switch v := value.(type) {
 	case string:
-		if strings.HasPrefix(v, "guardicore_") {
+		if strings.HasPrefix(v, "guardicore_") || strings.HasPrefix(v, "data.guardicore_") {
 			return v
 		}
 		return fmt.Sprintf("%q", v)
@@ -876,4 +1395,40 @@ func policyRuleName(rule map[string]interface{}) string {
 	}
 
 	return "rule"
+}
+
+func (imp *Importer) generateAgentAggregatorsFile(aggregators []client.AgentAggregator) error {
+	if len(aggregators) == 0 {
+		return nil
+	}
+
+	idToName := make(map[string]string, len(aggregators))
+	for _, a := range aggregators {
+		idToName[a.ID] = SanitizeName("", a.Hostname)
+	}
+	named := DeduplicateNames(idToName)
+
+	aggregatorByID := make(map[string]client.AgentAggregator, len(aggregators))
+	for _, a := range aggregators {
+		aggregatorByID[a.ID] = a
+	}
+
+	var buf bytes.Buffer
+	for i, nr := range named {
+		a := aggregatorByID[nr.ID]
+
+		data := AgentAggregatorTemplateData{
+			Name:     nr.Name,
+			Hostname: a.Hostname,
+		}
+
+		if err := agentAggregatorDataTemplate.Execute(&buf, data); err != nil {
+			return fmt.Errorf("failed to render agent aggregator data source %s: %w", a.ID, err)
+		}
+		if i < len(named)-1 {
+			buf.WriteString("\n")
+		}
+	}
+
+	return os.WriteFile(filepath.Join(imp.OutputDir, "agent_aggregators.tf"), buf.Bytes(), 0644)
 }

@@ -21,3 +21,15 @@ output "label_lookup_by_key_value" {
 output "label_criteria" {
   value = data.guardicore_label.by_id.criteria
 }
+
+# Look up a system-managed label.
+# System-managed labels are created by the platform and cannot be modified
+# by Terraform. The system_managed attribute indicates this.
+data "guardicore_label" "agent_installed" {
+  key   = "Agent"
+  value = "Installed"
+}
+
+output "label_system_managed" {
+  value = data.guardicore_label.agent_installed.system_managed
+}
