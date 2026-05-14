@@ -2,8 +2,8 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -29,7 +29,7 @@ type DnsSecurityDataSourceModel struct {
 	ID      types.String `tfsdk:"id"`
 	Name    types.String `tfsdk:"name"`
 	Type    types.String `tfsdk:"type"`
-	Domains types.List   `tfsdk:"domains"`
+	Domains types.Set    `tfsdk:"domains"`
 	Enabled types.Bool   `tfsdk:"enabled"`
 }
 
@@ -39,7 +39,8 @@ func (d *DnsSecurityDataSource) Metadata(ctx context.Context, req datasource.Met
 
 func (d *DnsSecurityDataSource) Schema(ctx context.Context, req datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Retrieves information about a DNS security blocklist. You can look up a blocklist by its ID or by name.",
+		MarkdownDescription: "Retrieves information about a DNS security blocklist. You can look up a blocklist by its ID or by name.\n\n" +
+			"~> **Note:** The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a \"DNS Security is not enabled\" error, enable it in the Akamai Guardicore Segmentation management console before using this data source.",
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -56,10 +57,10 @@ func (d *DnsSecurityDataSource) Schema(ctx context.Context, req datasource.Schem
 				Computed:            true,
 				MarkdownDescription: "The type of the DNS blocklist.",
 			},
-			"domains": schema.ListAttribute{
+			"domains": schema.SetAttribute{
 				Computed:            true,
 				ElementType:         types.StringType,
-				MarkdownDescription: "The list of domains in the blocklist.",
+				MarkdownDescription: "The set of domains in the blocklist.",
 			},
 			"enabled": schema.BoolAttribute{
 				Computed:            true,
@@ -101,7 +102,11 @@ func (d *DnsSecurityDataSource) Read(ctx context.Context, req datasource.ReadReq
 		var err error
 		blocklist, err = d.client.GetDnsBlocklist(ctx, data.ID.ValueString())
 		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read DNS blocklist by ID, got error: %s", err))
+			if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+				resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+			} else {
+				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read DNS blocklist by ID, got error: %s", err))
+			}
 			return
 		}
 		if blocklist == nil {
@@ -112,7 +117,11 @@ func (d *DnsSecurityDataSource) Read(ctx context.Context, req datasource.ReadReq
 		// Look up by name
 		blocklists, err := d.client.ListDnsBlocklists(ctx, data.Name.ValueString(), "")
 		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to list DNS blocklists, got error: %s", err))
+			if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+				resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+			} else {
+				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to list DNS blocklists, got error: %s", err))
+			}
 			return
 		}
 
@@ -147,14 +156,12 @@ func (d *DnsSecurityDataSource) Read(ctx context.Context, req datasource.ReadReq
 	data.Type = types.StringValue(blocklist.Type)
 	data.Enabled = types.BoolValue(blocklist.Enabled)
 
-	if len(blocklist.Domains) > 0 {
-		sortedDomains := make([]string, len(blocklist.Domains))
-		copy(sortedDomains, blocklist.Domains)
-		sort.Strings(sortedDomains)
-		data.Domains, _ = types.ListValueFrom(ctx, types.StringType, sortedDomains)
-	} else {
-		data.Domains = types.ListNull(types.StringType)
+	setValue, setDiags := dnsDomainsSetValue(blocklist.Domains)
+	resp.Diagnostics.Append(setDiags...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
+	data.Domains = setValue
 
 	tflog.Trace(ctx, "read DNS security data source", map[string]interface{}{"id": blocklist.ID})
 

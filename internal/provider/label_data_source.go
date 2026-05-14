@@ -25,10 +25,12 @@ type LabelDataSource struct {
 
 // LabelDataSourceModel describes the data source data model.
 type LabelDataSourceModel struct {
-	ID       types.String         `tfsdk:"id"`
-	Key      types.String         `tfsdk:"key"`
-	Value    types.String         `tfsdk:"value"`
-	Criteria []LabelCriteriaModel `tfsdk:"criteria"`
+	ID            types.String         `tfsdk:"id"`
+	Key           types.String         `tfsdk:"key"`
+	Value         types.String         `tfsdk:"value"`
+	Criteria      []LabelCriteriaModel `tfsdk:"criteria"`
+	SystemManaged types.Bool           `tfsdk:"system_managed"`
+	ManagedBy     types.String         `tfsdk:"managed_by"`
 }
 
 func (d *LabelDataSource) Metadata(ctx context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -37,7 +39,9 @@ func (d *LabelDataSource) Metadata(ctx context.Context, req datasource.MetadataR
 
 func (d *LabelDataSource) Schema(ctx context.Context, req datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Retrieves information about a label from Akamai Guardicore Segmentation. You can look up a label by its ID or by its key and value combination.",
+		MarkdownDescription: "Reads a label from Akamai Guardicore Segmentation.\n\n" +
+			"Use this data source to reference existing labels, including system-managed labels that cannot be modified by Terraform. " +
+			"The `system_managed` attribute indicates whether the label is managed by the platform.",
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -55,9 +59,9 @@ func (d *LabelDataSource) Schema(ctx context.Context, req datasource.SchemaReque
 				Computed:            true,
 				MarkdownDescription: "The value of the label. Used together with key to look up a label.",
 			},
-			"criteria": schema.ListNestedAttribute{
+			"criteria": schema.SetNestedAttribute{
 				Computed:            true,
-				MarkdownDescription: "Dynamic criteria for automatic label assignment.",
+				MarkdownDescription: "Dynamic criteria for automatic label assignment. Criteria are emitted as an unordered set to avoid drift from API ordering differences.",
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"field": schema.StringAttribute{
@@ -72,8 +76,36 @@ func (d *LabelDataSource) Schema(ctx context.Context, req datasource.SchemaReque
 							Computed:            true,
 							MarkdownDescription: "The argument to match against.",
 						},
+						"compound_criteria": schema.SetNestedAttribute{
+							Computed:            true,
+							MarkdownDescription: "Nested criteria matched as an unordered compound group.",
+							NestedObject: schema.NestedAttributeObject{
+								Attributes: map[string]schema.Attribute{
+									"field": schema.StringAttribute{
+										Computed:            true,
+										MarkdownDescription: "The field to match against.",
+									},
+									"op": schema.StringAttribute{
+										Computed:            true,
+										MarkdownDescription: "The operator for matching.",
+									},
+									"argument": schema.StringAttribute{
+										Computed:            true,
+										MarkdownDescription: "The argument to match against.",
+									},
+								},
+							},
+						},
 					},
 				},
+			},
+			"system_managed": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether this label is system-managed. System-managed labels cannot be updated or deleted by Terraform. Use the `guardicore_label` data source to reference them.",
+			},
+			"managed_by": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Identifies who manages this label. `terraform` for user-managed labels, or the system origin (e.g., `system`).",
 			},
 		},
 	}
@@ -118,13 +150,27 @@ func (d *LabelDataSource) Read(ctx context.Context, req datasource.ReadRequest, 
 			resp.Diagnostics.AddError("Not Found", fmt.Sprintf("Label with ID %s not found", data.ID.ValueString()))
 			return
 		}
+		// The single-GET endpoint may not return the read_only field;
+		// supplement via the list endpoint which does.
+		if label.ReadOnly == nil {
+			listLabels, listErr := d.client.ListLabels(ctx, label.Key, label.Value)
+			if listErr == nil {
+				for _, candidate := range listLabels {
+					if candidate.ID == label.ID {
+						label.ReadOnly = candidate.ReadOnly
+						break
+					}
+				}
+			}
+		}
 	} else if !data.Key.IsNull() && !data.Value.IsNull() {
 		// Look up by key and value
-		labels, err := d.client.ListLabels(ctx, data.Key.ValueString(), data.Value.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to list labels, got error: %s", err))
+		labels, listErr := d.client.ListLabels(ctx, data.Key.ValueString(), data.Value.ValueString())
+		if listErr != nil {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to list labels, got error: %s", listErr))
 			return
 		}
+
 		if len(labels) == 0 {
 			resp.Diagnostics.AddError("Not Found", fmt.Sprintf("Label with key=%s and value=%s not found", data.Key.ValueString(), data.Value.ValueString()))
 			return
@@ -150,15 +196,39 @@ func (d *LabelDataSource) Read(ctx context.Context, req datasource.ReadRequest, 
 	if len(label.DynamicCriteria) > 0 {
 		data.Criteria = make([]LabelCriteriaModel, len(label.DynamicCriteria))
 		for i, c := range label.DynamicCriteria {
+			if len(c.CompoundCriteria) > 0 {
+				compound := make([]LabelCompoundCriteriaModel, len(c.CompoundCriteria))
+				for j, cc := range c.CompoundCriteria {
+					compound[j] = LabelCompoundCriteriaModel{
+						Field:    types.StringValue(cc.Field),
+						Op:       types.StringValue(cc.Op),
+						Argument: types.StringValue(cc.Argument),
+					}
+				}
+
+				data.Criteria[i] = LabelCriteriaModel{
+					Field:            types.StringNull(),
+					Op:               types.StringNull(),
+					Argument:         types.StringNull(),
+					CompoundCriteria: compound,
+				}
+				continue
+			}
+
 			data.Criteria[i] = LabelCriteriaModel{
-				Field:    types.StringValue(c.Field),
-				Op:       types.StringValue(c.Op),
-				Argument: types.StringValue(c.Argument),
+				Field:            types.StringValue(c.Field),
+				Op:               types.StringValue(c.Op),
+				Argument:         types.StringValue(c.Argument),
+				CompoundCriteria: nil,
 			}
 		}
 	} else {
 		data.Criteria = nil
 	}
+
+	sm, mb := LabelIsSystemManaged(label)
+	data.SystemManaged = types.BoolValue(sm)
+	data.ManagedBy = types.StringValue(mb)
 
 	tflog.Trace(ctx, "read label data source", map[string]interface{}{"id": label.ID})
 

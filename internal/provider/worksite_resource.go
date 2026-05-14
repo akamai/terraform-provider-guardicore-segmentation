@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -27,14 +28,17 @@ func NewWorksiteResource() resource.Resource {
 
 // WorksiteResource defines the resource implementation.
 type WorksiteResource struct {
-	client *client.Client
+	client        *client.Client
+	deleteBatcher *Batcher[string, struct{}]
 }
 
 // WorksiteResourceModel describes the resource data model.
 type WorksiteResourceModel struct {
-	ID      types.String `tfsdk:"id"`
-	Name    types.String `tfsdk:"name"`
-	Comment types.String `tfsdk:"comment"`
+	ID            types.String `tfsdk:"id"`
+	Name          types.String `tfsdk:"name"`
+	Comment       types.String `tfsdk:"comment"`
+	SystemManaged types.Bool   `tfsdk:"system_managed"`
+	ManagedBy     types.String `tfsdk:"managed_by"`
 }
 
 func (r *WorksiteResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -44,6 +48,11 @@ func (r *WorksiteResource) Metadata(ctx context.Context, req resource.MetadataRe
 func (r *WorksiteResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages a worksite in Akamai Guardicore Segmentation. Worksites are used to organize and group agents, assets, and policy rules by physical or logical location.\n\n" +
+			"The \"Default\" worksite is system-managed and created by the platform. " +
+			"System-managed worksites can be read and referenced by other resources, but cannot be updated or deleted by Terraform.\n\n" +
+			"Use this resource for worksites that Terraform should create and manage. " +
+			"Use the `guardicore_worksite` data source to reference the system-managed \"Default\" worksite.\n\n" +
+			"When `system_managed` is `true`, any attempt to update or delete the worksite will return an error.\n\n" +
 			"~> **Note:** The worksites feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a \"worksites feature is disabled\" error, enable it in the Akamai Guardicore Segmentation management console before using this resource.\n\n" +
 			"Assets and policy rules can be assigned to a worksite using the `worksite_id` attribute on `guardicore_asset` and `guardicore_policy_rule` resources.",
 
@@ -70,6 +79,20 @@ func (r *WorksiteResource) Schema(ctx context.Context, req resource.SchemaReques
 					stringvalidator.LengthAtMost(2000),
 				},
 			},
+			"system_managed": schema.BoolAttribute{
+				Computed:            true,
+				MarkdownDescription: "Whether this worksite is system-managed. The \"Default\" worksite is system-managed and cannot be updated or deleted by Terraform. Use the `guardicore_worksite` data source to reference it.",
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"managed_by": schema.StringAttribute{
+				Computed:            true,
+				MarkdownDescription: "Identifies who manages this worksite. `terraform` for user-managed worksites, or `system` for the platform-managed \"Default\" worksite.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 		},
 	}
 }
@@ -89,6 +112,7 @@ func (r *WorksiteResource) Configure(ctx context.Context, req resource.Configure
 	}
 
 	r.client = providerData.Client
+	r.deleteBatcher = providerData.WorksiteDeleteBatcher
 }
 
 func (r *WorksiteResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -123,6 +147,9 @@ func (r *WorksiteResource) Create(ctx context.Context, req resource.CreateReques
 		r.apiToModel(created, &data)
 	}
 
+	data.SystemManaged = types.BoolValue(false)
+	data.ManagedBy = types.StringValue("terraform")
+
 	tflog.Trace(ctx, "created worksite", map[string]any{"id": id})
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
@@ -153,13 +180,28 @@ func (r *WorksiteResource) Read(ctx context.Context, req resource.ReadRequest, r
 
 	r.apiToModel(worksite, &data)
 
+	sm, mb := WorksiteIsSystemManaged(worksite)
+	data.SystemManaged = types.BoolValue(sm)
+	data.ManagedBy = types.StringValue(mb)
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
 func (r *WorksiteResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var data WorksiteResourceModel
+	var stateData WorksiteResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(req.State.Get(ctx, &stateData)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	DiagnoseSystemManagedMutation(stateData.SystemManaged, "worksite", data.ID.ValueString(), "update", &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -189,6 +231,8 @@ func (r *WorksiteResource) Update(ctx context.Context, req resource.UpdateReques
 	if updated != nil {
 		r.apiToModel(updated, &data)
 	}
+	data.SystemManaged = stateData.SystemManaged
+	data.ManagedBy = stateData.ManagedBy
 
 	tflog.Trace(ctx, "updated worksite", map[string]any{"id": data.ID.ValueString()})
 
@@ -203,7 +247,12 @@ func (r *WorksiteResource) Delete(ctx context.Context, req resource.DeleteReques
 		return
 	}
 
-	err := r.client.DeleteWorksite(ctx, data.ID.ValueString())
+	DiagnoseSystemManagedMutation(data.SystemManaged, "worksite", data.ID.ValueString(), "delete", &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	_, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString())
 	if err != nil {
 		if errors.Is(err, client.ErrWorksitesFeatureDisabled) {
 			resp.Diagnostics.AddError("Worksites Feature Disabled", err.Error())

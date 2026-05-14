@@ -1,10 +1,4 @@
 
-resource "guardicore_dns_security" "akamai_intelligence" {
-  name    = "Akamai Intelligence Feed"
-  type    = "AKAMAI_INTELLIGENCE"
-  enabled = true
-}
-
 resource "guardicore_dns_security" "custom_block" {
   name    = "Known Malware Domains"
   type    = "CUSTOM_BLOCK"
@@ -25,12 +19,6 @@ resource "guardicore_dns_security" "custom_exclusion" {
     "internal.example.com",
     "trusted.partner.example",
   ]
-}
-
-resource "guardicore_dns_security" "web_category" {
-  name    = "Gambling Category"
-  type    = "WEB_CATEGORY"
-  enabled = true
 }
 
 resource "guardicore_dns_security" "custom_blocklist" {

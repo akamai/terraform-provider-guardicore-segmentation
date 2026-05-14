@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
@@ -12,11 +13,14 @@ import (
 // mockReferenceChecker implements ReferenceChecker for testing.
 type mockReferenceChecker struct {
 	labels         map[string]*client.Label
+	listLabels     []client.Label
 	labelGroups    map[string]*client.LabelGroup
 	policyGroups   map[string]*client.PolicyGroup
 	userGroups     map[string]*client.UserGroup
 	assets         map[string]*client.Asset
 	worksites      map[string]*client.Worksite
+	getLabelCalls  map[string]int
+	listLabelCalls map[string]int
 	labelErr       error
 	groupErr       error
 	policyGroupErr error
@@ -26,6 +30,9 @@ type mockReferenceChecker struct {
 }
 
 func (m *mockReferenceChecker) GetLabel(_ context.Context, id string) (*client.Label, error) {
+	if m.getLabelCalls != nil {
+		m.getLabelCalls[id]++
+	}
 	if m.labelErr != nil {
 		return nil, m.labelErr
 	}
@@ -34,6 +41,34 @@ func (m *mockReferenceChecker) GetLabel(_ context.Context, id string) (*client.L
 		return nil, nil
 	}
 	return label, nil
+}
+
+func (m *mockReferenceChecker) ListLabels(_ context.Context, key, value string) ([]client.Label, error) {
+	if m.labelErr != nil {
+		return nil, m.labelErr
+	}
+	if m.listLabelCalls != nil {
+		m.listLabelCalls[key+"\x00"+value]++
+	}
+	source := m.listLabels
+	if source == nil {
+		source = make([]client.Label, 0, len(m.labels))
+		for _, label := range m.labels {
+			source = append(source, *label)
+		}
+	}
+
+	result := make([]client.Label, 0, len(source))
+	for _, label := range source {
+		if key != "" && label.Key != key {
+			continue
+		}
+		if value != "" && label.Value != value {
+			continue
+		}
+		result = append(result, label)
+	}
+	return result, nil
 }
 
 func (m *mockReferenceChecker) GetLabelGroup(_ context.Context, id string) (*client.LabelGroup, error) {
@@ -385,6 +420,47 @@ func TestValidateAssetLabelRefs_EmptySlice(t *testing.T) {
 	}
 }
 
+func TestValidateAssetLabelRefs_ReadOnlyLabelRejected(t *testing.T) {
+	checker := &mockReferenceChecker{
+		labels: map[string]*client.Label{
+			"readonly-label": {ID: "readonly-label", ReadOnly: boolPtrRef(true)},
+		},
+	}
+
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("readonly-label"), Key: types.StringValue("os_type"), Value: types.StringValue("Linux")},
+	}
+
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if !diags.HasError() {
+		t.Fatal("expected error for read-only asset label")
+	}
+}
+
+func TestValidateAssetLabelRefs_DynamicLabelRejected(t *testing.T) {
+	checker := &mockReferenceChecker{
+		labels: map[string]*client.Label{
+			"dynamic-label": {
+				ID:              "dynamic-label",
+				DynamicCriteria: []client.LabelCriteria{{Field: "name", Op: "CONTAINS", Argument: "db"}},
+			},
+		},
+	}
+
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("dynamic-label"), Key: types.StringValue("role"), Value: types.StringValue("database")},
+	}
+
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if !diags.HasError() {
+		t.Fatal("expected error for dynamic asset label")
+	}
+}
+
+func boolPtrRef(v bool) *bool {
+	return &v
+}
+
 // TestLabelGroupReferencesLabel tests the helper used in lifecycle protection.
 func TestLabelGroupReferencesLabel_Found(t *testing.T) {
 	group := &client.LabelGroup{
@@ -658,6 +734,31 @@ func TestValidatePolicyRuleRefs_MixedRefs(t *testing.T) {
 	diags := validatePolicyRuleRefs(context.Background(), checker, specJSON)
 	if diags.HasError() {
 		t.Fatalf("expected no errors for valid mixed refs, got: %v", diags)
+	}
+}
+
+func TestValidatePolicyRuleRefs_InvalidEndpointReferenceShape(t *testing.T) {
+	checker := &mockReferenceChecker{
+		labelGroups: map[string]*client.LabelGroup{
+			"group-1": {ID: "group-1"},
+		},
+	}
+
+	specJSON := `{"source":{"label_group_ids":["group-1"],"user_group_ids":[{"id":"ug-1","name":"Local Administrators"}]}}`
+	diags := validatePolicyRuleRefs(context.Background(), checker, specJSON)
+	if !diags.HasError() {
+		t.Fatal("expected error for non-string user_group_ids entry")
+	}
+
+	found := false
+	for _, d := range diags {
+		if strings.Contains(d.Detail(), "policy_rule.source.user_group_ids[0]") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected diagnostic to include exact path for invalid ref shape, got: %v", diags)
 	}
 }
 

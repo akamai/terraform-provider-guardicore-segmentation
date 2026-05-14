@@ -16,3 +16,14 @@ output "worksite_details" {
     comment = data.guardicore_worksite.headquarters.comment
   }
 }
+
+# Look up the system-managed "Default" worksite.
+# The Default worksite is created by the platform and cannot be modified
+# by Terraform.
+data "guardicore_worksite" "default" {
+  name = "Default"
+}
+
+output "worksite_system_managed" {
+  value = data.guardicore_worksite.default.system_managed
+}

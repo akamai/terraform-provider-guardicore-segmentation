@@ -9,6 +9,18 @@ description: |-
 
 {{ .Description | trimspace }}
 
+## Requirements
+
+```terraform
+terraform {
+  required_providers {
+    guardicore = {
+      source = "akamai/guardicore-segmentation"
+    }
+  }
+}
+```
+
 {{- if .HasExamples }}
 
 ## Example Usage

@@ -2,11 +2,12 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -28,7 +29,10 @@ func NewDnsSecurityResource() resource.Resource {
 
 // DnsSecurityResource defines the resource implementation.
 type DnsSecurityResource struct {
-	client *client.Client
+	client        *client.Client
+	createBatcher *Batcher[*client.DnsBlocklistCreate, string]
+	updateBatcher *Batcher[dnsSecurityUpdateReq, struct{}]
+	deleteBatcher *Batcher[string, struct{}]
 }
 
 // DnsSecurityResourceModel describes the resource data model.
@@ -36,7 +40,7 @@ type DnsSecurityResourceModel struct {
 	ID      types.String `tfsdk:"id"`
 	Name    types.String `tfsdk:"name"`
 	Type    types.String `tfsdk:"type"`
-	Domains types.List   `tfsdk:"domains"`
+	Domains types.Set    `tfsdk:"domains"`
 	Enabled types.Bool   `tfsdk:"enabled"`
 }
 
@@ -46,7 +50,8 @@ func (r *DnsSecurityResource) Metadata(ctx context.Context, req resource.Metadat
 
 func (r *DnsSecurityResource) Schema(ctx context.Context, req resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Manages a DNS security blocklist in Akamai Guardicore Segmentation. DNS blocklists allow you to block or exclude specific domains from DNS resolution.",
+		MarkdownDescription: "Manages a DNS security blocklist in Akamai Guardicore Segmentation. DNS blocklists allow you to block or exclude specific domains from DNS resolution.\n\n" +
+			"~> **Note:** The DNS Security feature must be enabled on the Akamai Guardicore Segmentation instance. If you receive a \"DNS Security is not enabled\" error, enable it in the Akamai Guardicore Segmentation management console before using this resource.",
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -62,7 +67,7 @@ func (r *DnsSecurityResource) Schema(ctx context.Context, req resource.SchemaReq
 			},
 			"type": schema.StringAttribute{
 				Required:            true,
-				MarkdownDescription: "The type of the DNS blocklist. Valid values: `AKAMAI_INTELLIGENCE`, `CUSTOM_BLOCK`, `CUSTOM_EXCLUSION`, `WEB_CATEGORY`, `CUSTOM_BLOCKLIST`, `EXCLUSION_LIST`.",
+				MarkdownDescription: "The type of the DNS blocklist. Valid values: `AKAMAI_INTELLIGENCE`, `CUSTOM_BLOCK`, `CUSTOM_EXCLUSION`, `WEB_CATEGORY`, `CUSTOM_BLOCKLIST`, `EXCLUSION_LIST`. `AKAMAI_INTELLIGENCE` and `WEB_CATEGORY` are system-managed and cannot be used when creating this resource (use the `guardicore_dns_security` data source to reference them). Changing this requires resource replacement.",
 				Validators: []validator.String{
 					stringvalidator.OneOf(
 						"AKAMAI_INTELLIGENCE",
@@ -73,11 +78,14 @@ func (r *DnsSecurityResource) Schema(ctx context.Context, req resource.SchemaReq
 						"EXCLUSION_LIST",
 					),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
-			"domains": schema.ListAttribute{
+			"domains": schema.SetAttribute{
 				Optional:            true,
 				ElementType:         types.StringType,
-				MarkdownDescription: "The list of domains in the blocklist.",
+				MarkdownDescription: "The set of domains in the blocklist.",
 			},
 			"enabled": schema.BoolAttribute{
 				Optional:            true,
@@ -104,6 +112,9 @@ func (r *DnsSecurityResource) Configure(ctx context.Context, req resource.Config
 	}
 
 	r.client = providerData.Client
+	r.createBatcher = providerData.DnsSecurityCreateBatcher
+	r.updateBatcher = providerData.DnsSecurityUpdateBatcher
+	r.deleteBatcher = providerData.DnsSecurityDeleteBatcher
 }
 
 func (r *DnsSecurityResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -116,9 +127,24 @@ func (r *DnsSecurityResource) Create(ctx context.Context, req resource.CreateReq
 
 	blocklist := r.modelToAPI(ctx, &data)
 
-	id, err := r.client.CreateDnsBlocklist(ctx, blocklist)
+	if DnsBlocklistTypeIsSystemManaged(blocklist.Type) {
+		resp.Diagnostics.AddError(
+			"System-Managed DNS Blocklist Type",
+			fmt.Sprintf(
+				"DNS blocklist type %q is system-managed and cannot be used when creating guardicore_dns_security resources. Use data \"guardicore_dns_security\" to reference existing system-managed blocklists.",
+				blocklist.Type,
+			),
+		)
+		return
+	}
+
+	id, err := r.createBatcher.Enqueue(ctx, blocklist)
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create DNS blocklist, got error: %s", err))
+		if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+			resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+		} else {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create DNS blocklist, got error: %s", err))
+		}
 		return
 	}
 
@@ -130,9 +156,26 @@ func (r *DnsSecurityResource) Create(ctx context.Context, req resource.CreateReq
 		edit := &client.DnsBlocklistEdit{Enabled: &enabled}
 		err = r.client.UpdateDnsBlocklist(ctx, id, edit)
 		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update DNS blocklist after creation, got error: %s", err))
+			if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+				resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+			} else {
+				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update DNS blocklist after creation, got error: %s", err))
+			}
 			return
 		}
+	}
+
+	created, err := waitForReadAfterCreate(ctx, "dns blocklist", func(ctx context.Context) (*client.DnsBlocklist, error) {
+		return r.client.GetDnsBlocklist(ctx, id)
+	})
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read DNS blocklist after creation, got error: %s", err))
+		return
+	}
+
+	resp.Diagnostics.Append(r.apiToModel(created, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
 	tflog.Trace(ctx, "created DNS blocklist", map[string]interface{}{"id": id})
@@ -150,7 +193,11 @@ func (r *DnsSecurityResource) Read(ctx context.Context, req resource.ReadRequest
 
 	blocklist, err := r.client.GetDnsBlocklist(ctx, data.ID.ValueString())
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read DNS blocklist, got error: %s", err))
+		if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+			resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+		} else {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read DNS blocklist, got error: %s", err))
+		}
 		return
 	}
 
@@ -159,7 +206,10 @@ func (r *DnsSecurityResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
-	r.apiToModel(ctx, blocklist, &data)
+	resp.Diagnostics.Append(r.apiToModel(blocklist, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -193,9 +243,13 @@ func (r *DnsSecurityResource) Update(ctx context.Context, req resource.UpdateReq
 		edit.Domains = []string{}
 	}
 
-	err := r.client.UpdateDnsBlocklist(ctx, data.ID.ValueString(), edit)
+	_, err := r.updateBatcher.Enqueue(ctx, dnsSecurityUpdateReq{id: data.ID.ValueString(), edit: edit})
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update DNS blocklist, got error: %s", err))
+		if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+			resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+		} else {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update DNS blocklist, got error: %s", err))
+		}
 		return
 	}
 
@@ -212,9 +266,13 @@ func (r *DnsSecurityResource) Delete(ctx context.Context, req resource.DeleteReq
 		return
 	}
 
-	err := r.client.DeleteDnsBlocklist(ctx, data.ID.ValueString())
+	_, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString())
 	if err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete DNS blocklist, got error: %s", err))
+		if errors.Is(err, client.ErrDnsSecurityFeatureDisabled) {
+			resp.Diagnostics.AddError("DNS Security Feature Disabled", err.Error())
+		} else {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete DNS blocklist, got error: %s", err))
+		}
 		return
 	}
 
@@ -244,24 +302,17 @@ func (r *DnsSecurityResource) modelToAPI(ctx context.Context, data *DnsSecurityR
 }
 
 // apiToModel converts the API struct to Terraform model.
-func (r *DnsSecurityResource) apiToModel(ctx context.Context, blocklist *client.DnsBlocklist, data *DnsSecurityResourceModel) {
+func (r *DnsSecurityResource) apiToModel(blocklist *client.DnsBlocklist, data *DnsSecurityResourceModel) diag.Diagnostics {
+	var diags diag.Diagnostics
+
 	data.ID = types.StringValue(blocklist.ID)
 	data.Name = types.StringValue(blocklist.Name)
 	data.Type = types.StringValue(blocklist.Type)
 	data.Enabled = types.BoolValue(blocklist.Enabled)
 
-	if len(blocklist.Domains) > 0 {
-		// Sort domains for stable state
-		sortedDomains := make([]string, len(blocklist.Domains))
-		copy(sortedDomains, blocklist.Domains)
-		sort.Strings(sortedDomains)
+	setValue, setDiags := dnsDomainsSetValue(blocklist.Domains)
+	diags.Append(setDiags...)
+	data.Domains = setValue
 
-		domainValues := make([]types.String, len(sortedDomains))
-		for i, d := range sortedDomains {
-			domainValues[i] = types.StringValue(d)
-		}
-		data.Domains, _ = types.ListValueFrom(ctx, types.StringType, sortedDomains)
-	} else {
-		data.Domains = types.ListNull(types.StringType)
-	}
+	return diags
 }

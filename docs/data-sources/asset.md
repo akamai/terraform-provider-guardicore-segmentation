@@ -41,7 +41,7 @@ output "asset_inventory_details" {
     nics                   = data.guardicore_asset.database_primary.nics
     labels                 = data.guardicore_asset.database_primary.labels
     comments               = data.guardicore_asset.database_primary.comments
-    orchestration_metadata = data.guardicore_asset.database_primary.orchestration_metadata_json
+    orchestration_metadata = data.guardicore_asset.database_primary.orchestration_metadata
     first_seen             = data.guardicore_asset.database_primary.first_seen
     last_seen              = data.guardicore_asset.database_primary.last_seen
   }
@@ -66,7 +66,7 @@ output "asset_inventory_details" {
 - `labels` (Attributes List) List of labels assigned to the asset. (see [below for nested schema](#nestedatt--labels))
 - `last_seen` (String) Timestamp when the asset was last seen.
 - `nics` (Attributes List) List of network interfaces for the asset. (see [below for nested schema](#nestedatt--nics))
-- `orchestration_metadata_json` (String) Orchestration metadata as a JSON string.
+- `orchestration_metadata` (Attributes) (see [below for nested schema](#nestedatt--orchestration_metadata))
 - `orchestration_obj_id` (String) Primary key of the asset from the customer's database or playbook.
 - `status` (String) Current asset status (`on`, `off`, or `deleted`).
 - `worksite_id` (String) The worksite ID assigned to this asset.
@@ -78,6 +78,8 @@ Read-Only:
 
 - `id` (String) The label ID.
 - `key` (String) The label key.
+- `origin` (String) The label origin returned by Guardicore.
+- `read_only` (Boolean) Whether the label is read-only and managed by the server.
 - `value` (String) The label value.
 
 
@@ -94,3 +96,15 @@ Read-Only:
 - `network_name` (String) Network name.
 - `switch_id` (String) Switch ID.
 - `vif_id` (String) Virtual interface ID.
+
+
+<a id="nestedatt--orchestration_metadata"></a>
+### Nested Schema for `orchestration_metadata`
+
+Read-Only:
+
+- `asset_type` (String)
+- `extra_json` (String)
+- `f5_device_hostname` (String)
+- `partition` (String)
+- `vs_name` (String)

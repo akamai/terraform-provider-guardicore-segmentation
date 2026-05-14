@@ -10,6 +10,8 @@ import (
 )
 
 func TestAccIncidentDataSource_byID(t *testing.T) {
+	testAccPreCheck(t)
+
 	// First, find an existing incident via the API to use for the data source test.
 	// Incidents created via v4.0 may not be immediately queryable via v3.0 generic-incidents,
 	// so we use a pre-existing incident from the environment.

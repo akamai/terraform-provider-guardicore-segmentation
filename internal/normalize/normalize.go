@@ -25,6 +25,33 @@ func normalizePolicyRuleReferenceIDs(value interface{}) interface{} {
 	return normalized
 }
 
+func normalizePolicyRuleLabelsExpression(value interface{}) interface{} {
+	labels, ok := value.(map[string]interface{})
+	if !ok {
+		return value
+	}
+
+	rawOrLabels, ok := labels["or_labels"].([]interface{})
+	if !ok {
+		return labels
+	}
+
+	for i, rawOrLabel := range rawOrLabels {
+		orLabel, ok := rawOrLabel.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		if andLabels, ok := orLabel["and_labels"]; ok {
+			orLabel["and_labels"] = normalizePolicyRuleReferenceIDs(andLabels)
+		}
+		rawOrLabels[i] = orLabel
+	}
+
+	labels["or_labels"] = rawOrLabels
+	return labels
+}
+
 // NormalizeJSON normalizes a JSON object by sorting keys to ensure consistent output.
 func NormalizeJSON(data map[string]interface{}) (string, error) {
 	normalized := NormalizeValue(data)
@@ -64,7 +91,7 @@ func NormalizePolicyRuleSpec(rule map[string]interface{}) map[string]interface{}
 	filtered := make(map[string]interface{})
 	for key, value := range rule {
 		switch key {
-		case "id", "created_at", "updated_at", "author", "creation_time", "last_change_time", "hit_count", "hit_count_reset_time", "last_hit", "state", "read_only", "objects", "worksite", "attributes":
+		case "id", "created_at", "updated_at", "author", "creation_time", "last_change_time", "hit_count", "hit_count_reset_time", "last_hit", "state", "read_only", "objects", "worksite", "attributes", "creation_origin":
 			continue
 		default:
 			if key == "comments" {
@@ -104,12 +131,18 @@ func NormalizePolicyRuleSpec(rule map[string]interface{}) map[string]interface{}
 
 	if ports, ok := normalized["ports"]; ok {
 		normalized["ports"] = NormalizeNumberSlice(ports)
+		if items, ok := normalized["ports"].([]interface{}); ok && len(items) == 0 {
+			delete(normalized, "ports")
+		}
 	}
 	if ports, ok := normalized["exclude_ports"]; ok {
 		normalized["exclude_ports"] = NormalizeNumberSlice(ports)
 	}
 	if protocols, ok := normalized["ip_protocols"]; ok {
 		normalized["ip_protocols"] = NormalizeStringSlice(protocols)
+		if items, ok := normalized["ip_protocols"].([]interface{}); ok && len(items) == 0 {
+			delete(normalized, "ip_protocols")
+		}
 	}
 	if scope, ok := normalized["scope"]; ok {
 		normalizedScope := NormalizeStringSlice(scope)
@@ -221,12 +254,28 @@ func NormalizePolicyRuleEndpoint(endpoint interface{}) interface{} {
 		}
 	}
 
+	if _, ok := mapped["label_group_ids"]; ok {
+		mapped["label_group_ids"] = normalizePolicyRuleReferenceIDs(mapped["label_group_ids"])
+	}
+
+	if _, ok := mapped["user_group_ids"]; ok {
+		mapped["user_group_ids"] = normalizePolicyRuleReferenceIDs(mapped["user_group_ids"])
+	}
+
+	if _, ok := mapped["asset_ids"]; ok {
+		mapped["asset_ids"] = normalizePolicyRuleReferenceIDs(mapped["asset_ids"])
+	}
+
+	if _, ok := mapped["policy_groups"]; ok {
+		mapped["policy_groups"] = normalizePolicyRuleReferenceIDs(mapped["policy_groups"])
+	}
+
 	if _, ok := mapped["labels"]; ok {
+		mapped["labels"] = normalizePolicyRuleLabelsExpression(mapped["labels"])
 		return mapped
 	}
 
 	if _, ok := mapped["label_group_ids"]; ok {
-		mapped["label_group_ids"] = normalizePolicyRuleReferenceIDs(mapped["label_group_ids"])
 		return mapped
 	}
 
@@ -243,17 +292,14 @@ func NormalizePolicyRuleEndpoint(endpoint interface{}) interface{} {
 	}
 
 	if _, ok := mapped["user_group_ids"]; ok {
-		mapped["user_group_ids"] = normalizePolicyRuleReferenceIDs(mapped["user_group_ids"])
 		return mapped
 	}
 
 	if _, ok := mapped["asset_ids"]; ok {
-		mapped["asset_ids"] = normalizePolicyRuleReferenceIDs(mapped["asset_ids"])
 		return mapped
 	}
 
 	if _, ok := mapped["policy_groups"]; ok {
-		mapped["policy_groups"] = normalizePolicyRuleReferenceIDs(mapped["policy_groups"])
 		return mapped
 	}
 

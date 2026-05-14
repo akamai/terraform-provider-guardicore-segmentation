@@ -21,6 +21,8 @@ func TestAccUserGroupDataSource_byID(t *testing.T) {
 					resource.TestCheckResourceAttrPair("data.guardicore_user_group.test", "id", "guardicore_user_group.test", "id"),
 					resource.TestCheckResourceAttr("data.guardicore_user_group.test", "title", title),
 					resource.TestCheckResourceAttr("data.guardicore_user_group.test", "orchestrations_groups.#", "1"),
+					resource.TestCheckResourceAttr("data.guardicore_user_group.test", "system_managed", "false"),
+					resource.TestCheckResourceAttr("data.guardicore_user_group.test", "managed_by", "terraform"),
 				),
 			},
 		},

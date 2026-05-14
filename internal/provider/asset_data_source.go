@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
@@ -27,20 +26,20 @@ type AssetDataSource struct {
 
 // AssetDataSourceModel describes the data source data model.
 type AssetDataSourceModel struct {
-	ID                        types.String      `tfsdk:"id"`
-	Name                      types.String      `tfsdk:"name"`
-	Nics                      []NICModel        `tfsdk:"nics"`
-	OrchestrationObjID        types.String      `tfsdk:"orchestration_obj_id"`
-	Status                    types.String      `tfsdk:"status"`
-	Labels                    []AssetLabelModel `tfsdk:"labels"`
-	Comments                  types.String      `tfsdk:"comments"`
-	OrchestrationMetadataJSON types.String      `tfsdk:"orchestration_metadata_json"`
-	WorksiteID                types.String      `tfsdk:"worksite_id"`
-	InstanceID                types.String      `tfsdk:"instance_id"`
-	HwUUID                    types.String      `tfsdk:"hw_uuid"`
-	BiosUUID                  types.String      `tfsdk:"bios_uuid"`
-	FirstSeen                 types.String      `tfsdk:"first_seen"`
-	LastSeen                  types.String      `tfsdk:"last_seen"`
+	ID                    types.String      `tfsdk:"id"`
+	Name                  types.String      `tfsdk:"name"`
+	Nics                  []NICModel        `tfsdk:"nics"`
+	OrchestrationObjID    types.String      `tfsdk:"orchestration_obj_id"`
+	Status                types.String      `tfsdk:"status"`
+	Labels                []AssetLabelModel `tfsdk:"labels"`
+	Comments              types.String      `tfsdk:"comments"`
+	OrchestrationMetadata types.Object      `tfsdk:"orchestration_metadata"`
+	WorksiteID            types.String      `tfsdk:"worksite_id"`
+	InstanceID            types.String      `tfsdk:"instance_id"`
+	HwUUID                types.String      `tfsdk:"hw_uuid"`
+	BiosUUID              types.String      `tfsdk:"bios_uuid"`
+	FirstSeen             types.String      `tfsdk:"first_seen"`
+	LastSeen              types.String      `tfsdk:"last_seen"`
 }
 
 func (d *AssetDataSource) Metadata(ctx context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -128,6 +127,14 @@ func (d *AssetDataSource) Schema(ctx context.Context, req datasource.SchemaReque
 							Computed:            true,
 							MarkdownDescription: "The label value.",
 						},
+						"origin": schema.StringAttribute{
+							Computed:            true,
+							MarkdownDescription: "The label origin returned by Guardicore.",
+						},
+						"read_only": schema.BoolAttribute{
+							Computed:            true,
+							MarkdownDescription: "Whether the label is read-only and managed by the server.",
+						},
 					},
 				},
 			},
@@ -135,10 +142,7 @@ func (d *AssetDataSource) Schema(ctx context.Context, req datasource.SchemaReque
 				Computed:            true,
 				MarkdownDescription: "Additional asset comments.",
 			},
-			"orchestration_metadata_json": schema.StringAttribute{
-				Computed:            true,
-				MarkdownDescription: "Orchestration metadata as a JSON string.",
-			},
+			"orchestration_metadata": assetOrchestrationMetadataDataSourceSchemaAttribute(),
 			"worksite_id": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "The worksite ID assigned to this asset.",
@@ -261,19 +265,24 @@ func (d *AssetDataSource) apiToModel(ctx context.Context, asset *client.Asset, d
 			diags.Append(d...)
 
 			nics[i] = NICModel{
-				VifID:                types.StringValue(nic.VifID),
-				MacAddress:           types.StringValue(nic.MacAddress),
-				NetworkID:            types.StringValue(nic.NetworkID),
-				NetworkName:          types.StringValue(nic.NetworkName),
-				IsCorporateInterface: types.BoolValue(nic.IsCorporateInterface),
-				SwitchID:             types.StringValue(nic.SwitchID),
-				IPAddresses:          ipList,
+				VifID:       types.StringValue(nic.VifID),
+				MacAddress:  types.StringValue(nic.MacAddress),
+				NetworkID:   types.StringValue(nic.NetworkID),
+				NetworkName: types.StringValue(nic.NetworkName),
+				SwitchID:    types.StringValue(nic.SwitchID),
+				IPAddresses: ipList,
 			}
 
 			if nic.IsCloudPublic != nil {
 				nics[i].IsCloudPublic = types.BoolValue(*nic.IsCloudPublic)
 			} else {
 				nics[i].IsCloudPublic = types.BoolNull()
+			}
+
+			if nic.IsCorporateInterface != nil {
+				nics[i].IsCorporateInterface = types.BoolValue(*nic.IsCorporateInterface)
+			} else {
+				nics[i].IsCorporateInterface = types.BoolNull()
 			}
 		}
 		data.Nics = nics
@@ -283,11 +292,7 @@ func (d *AssetDataSource) apiToModel(ctx context.Context, asset *client.Asset, d
 	if asset.Labels != nil {
 		labels := make([]AssetLabelModel, len(asset.Labels))
 		for i, l := range asset.Labels {
-			labels[i] = AssetLabelModel{
-				ID:    types.StringValue(l.ID),
-				Key:   types.StringValue(l.Key),
-				Value: types.StringValue(l.Value),
-			}
+			labels[i] = assetLabelModelFromAPI(l, nil)
 		}
 		data.Labels = labels
 	}
@@ -298,14 +303,10 @@ func (d *AssetDataSource) apiToModel(ctx context.Context, asset *client.Asset, d
 	data.InstanceID = types.StringValue(asset.InstanceID)
 	data.HwUUID = types.StringValue(asset.HwUUID)
 
-	if len(asset.OrchestrationMetadata) > 0 && string(asset.OrchestrationMetadata) != "null" {
-		// Compact JSON for consistent output
-		var raw json.RawMessage
-		if err := json.Unmarshal(asset.OrchestrationMetadata, &raw); err == nil {
-			data.OrchestrationMetadataJSON = types.StringValue(string(raw))
-		}
-	} else {
-		data.OrchestrationMetadataJSON = types.StringValue("")
+	obj, metaDiags := assetOrchestrationMetadataObjectFromAPI(asset.OrchestrationMetadata)
+	diags.Append(metaDiags...)
+	if !metaDiags.HasError() {
+		data.OrchestrationMetadata = obj
 	}
 
 	// Convert worksite

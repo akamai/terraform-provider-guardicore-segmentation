@@ -20,6 +20,8 @@ func TestAccLabelDataSource_byID(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("data.guardicore_label.test", "key", key),
 					resource.TestCheckResourceAttr("data.guardicore_label.test", "value", value),
+					resource.TestCheckResourceAttr("data.guardicore_label.test", "system_managed", "false"),
+					resource.TestCheckResourceAttr("data.guardicore_label.test", "managed_by", "terraform"),
 				),
 			},
 		},
@@ -88,9 +90,7 @@ func TestAccLabelDataSource_withCriteria(t *testing.T) {
 					resource.TestCheckResourceAttr("data.guardicore_label.test", "key", key),
 					resource.TestCheckResourceAttr("data.guardicore_label.test", "value", value),
 					resource.TestCheckResourceAttr("data.guardicore_label.test", "criteria.#", "1"),
-					resource.TestCheckResourceAttr("data.guardicore_label.test", "criteria.0.field", "name"),
-					resource.TestCheckResourceAttr("data.guardicore_label.test", "criteria.0.op", "CONTAINS"),
-					resource.TestCheckResourceAttr("data.guardicore_label.test", "criteria.0.argument", "redis"),
+					testCheckLabelCriteriaContains("data.guardicore_label.test", "CONTAINS", "redis"),
 				),
 			},
 		},
@@ -116,4 +116,31 @@ data "guardicore_label" "test" {
   id = guardicore_label.test.id
 }
 `, key, value)
+}
+
+func TestAccLabelDataSource_systemManagedByID(t *testing.T) {
+	label := testAccReadOnlyLabel(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccLabelDataSourceConfigReadOnlyByID(label.ID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("data.guardicore_label.test", "id", label.ID),
+					resource.TestCheckResourceAttr("data.guardicore_label.test", "system_managed", "true"),
+					resource.TestCheckResourceAttrSet("data.guardicore_label.test", "managed_by"),
+				),
+			},
+		},
+	})
+}
+
+func testAccLabelDataSourceConfigReadOnlyByID(id string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+data "guardicore_label" "test" {
+  id = %[1]q
+}
+`, id)
 }

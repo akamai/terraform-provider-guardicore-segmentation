@@ -19,6 +19,8 @@ func TestAccWorksiteDataSource_byID(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("data.guardicore_worksite.test", "id"),
 					resource.TestCheckResourceAttr("data.guardicore_worksite.test", "name", name),
+					resource.TestCheckResourceAttr("data.guardicore_worksite.test", "system_managed", "false"),
+					resource.TestCheckResourceAttr("data.guardicore_worksite.test", "managed_by", "terraform"),
 				),
 			},
 		},

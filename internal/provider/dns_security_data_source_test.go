@@ -11,7 +11,7 @@ func TestAccDnsSecurityDataSource_byID(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
@@ -44,7 +44,7 @@ func TestAccDnsSecurityDataSource_byName(t *testing.T) {
 	name := testAccRandomName("tf-acc-dns")
 
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
+		PreCheck:                 func() { testAccDnsSecurityPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{

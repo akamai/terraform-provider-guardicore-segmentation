@@ -27,6 +27,9 @@ func NewLabelGroupResource() resource.Resource {
 // LabelGroupResource defines the resource implementation.
 type LabelGroupResource struct {
 	client                *client.Client
+	createBatcher         *Batcher[*client.LabelGroupCreate, *client.LabelGroupCreate]
+	updateBatcher         *Batcher[labelGroupUpdateReq, *client.LabelGroupCreate]
+	deleteBatcher         *Batcher[string, struct{}]
 	validateRefsOnDestroy bool
 	strictRefsOnDestroy   bool
 }
@@ -114,6 +117,9 @@ func (r *LabelGroupResource) Configure(ctx context.Context, req resource.Configu
 	}
 
 	r.client = providerData.Client
+	r.createBatcher = providerData.LabelGroupCreateBatcher
+	r.updateBatcher = providerData.LabelGroupUpdateBatcher
+	r.deleteBatcher = providerData.LabelGroupDeleteBatcher
 	r.validateRefsOnDestroy = providerData.ValidateRefsOnDestroy
 	r.strictRefsOnDestroy = providerData.StrictRefsOnDestroy
 }
@@ -142,14 +148,9 @@ func (r *LabelGroupResource) Create(ctx context.Context, req resource.CreateRequ
 		return
 	}
 
-	createdLabelGroup, err := r.client.CreateLabelGroup(ctx, labelGroup)
+	createdLabelGroup, err := r.createBatcher.Enqueue(ctx, labelGroup)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create label group, got error: %s", err))
-		return
-	}
-
-	if err := r.client.PublishLabelGroups(ctx); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to publish label groups, got error: %s", err))
 		return
 	}
 
@@ -218,14 +219,12 @@ func (r *LabelGroupResource) Update(ctx context.Context, req resource.UpdateRequ
 		return
 	}
 
-	updatedLabelGroup, err := r.client.UpdateLabelGroup(ctx, data.ID.ValueString(), labelGroup)
+	updatedLabelGroup, err := r.updateBatcher.Enqueue(ctx, labelGroupUpdateReq{
+		id:         data.ID.ValueString(),
+		labelGroup: labelGroup,
+	})
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update label group, got error: %s", err))
-		return
-	}
-
-	if err := r.client.PublishLabelGroups(ctx); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to publish label groups, got error: %s", err))
 		return
 	}
 
@@ -255,14 +254,8 @@ func (r *LabelGroupResource) Delete(ctx context.Context, req resource.DeleteRequ
 		}
 	}
 
-	err := r.client.DeleteLabelGroup(ctx, data.ID.ValueString())
-	if err != nil {
+	if _, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString()); err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete label group, got error: %s", err))
-		return
-	}
-
-	if err := r.client.PublishLabelGroups(ctx); err != nil {
-		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to publish label groups, got error: %s", err))
 		return
 	}
 

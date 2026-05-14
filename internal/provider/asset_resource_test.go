@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -34,11 +35,10 @@ func TestAccAssetResource_basic(t *testing.T) {
 			},
 			// ImportState testing.
 			{
-				ResourceName:      "guardicore_asset.test",
-				ImportState:       true,
-				ImportStateVerify: true,
-				// orchestration_metadata_json may not round-trip exactly
-				ImportStateVerifyIgnore: []string{"orchestration_metadata_json", "orchestration_obj_id"},
+				ResourceName:            "guardicore_asset.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"orchestration_metadata", "orchestration_obj_id"},
 			},
 			// Update name and Read testing.
 			{
@@ -78,7 +78,7 @@ func TestAccAssetResource_withOptionalFields(t *testing.T) {
 				ResourceName:            "guardicore_asset.test",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"orchestration_metadata_json", "orchestration_obj_id"},
+				ImportStateVerifyIgnore: []string{"orchestration_metadata", "orchestration_obj_id"},
 			},
 		},
 	})
@@ -138,6 +138,63 @@ func TestAccAssetResource_disappears(t *testing.T) {
 	})
 }
 
+func TestAccAssetResource_driftOnRemoteCommentsChange(t *testing.T) {
+	name := testAccRandomName("tf-acc-asset-drift")
+	orchObjID := testAccRandomName("orch-drift")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAssetResourceConfigFull(name, orchObjID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("guardicore_asset.test", "comments", "Test asset comment"),
+				),
+			},
+			{
+				Config: testAccAssetResourceConfigFull(name, orchObjID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccUpdateAssetCommentsOutOfBand("guardicore_asset.test", "remote-change-comment"),
+				),
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config:             testAccAssetResourceConfigFull(name, orchObjID),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+func TestAccAssetResource_eventualConsistencyReadAfterCreate(t *testing.T) {
+	restoreHook := setReadAfterCreateVisibilityHookForTest(func(resourceName string, attempt int) bool {
+		return resourceName == "asset" && attempt <= 2
+	})
+	t.Cleanup(restoreHook)
+
+	name := testAccRandomName("tf-acc-asset-ec")
+	orchObjID := testAccRandomName("orch-ec")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAssetResourceConfig(name, orchObjID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "name", name),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "orchestration_obj_id", orchObjID),
+				),
+			},
+		},
+	})
+}
+
 func TestAccAssetResource_validation(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccAssetPreCheck(t) },
@@ -153,8 +210,64 @@ func TestAccAssetResource_validation(t *testing.T) {
 				Config:      testAccAssetResourceConfigWithStatus("test-name", "orch-1", "invalid"),
 				ExpectError: regexp.MustCompile(`.*value must be one of.*`),
 			},
+			// extra_json must be object
+			{
+				Config:      testAccAssetResourceConfigWithInvalidMetadataExtraType("test-name", "orch-1"),
+				ExpectError: regexp.MustCompile(`(?s).*extra_json.*must be a JSON object.*`),
+			},
+			// extra_json cannot override typed keys
+			{
+				Config:      testAccAssetResourceConfigWithReservedMetadataExtraKey("test-name", "orch-1"),
+				ExpectError: regexp.MustCompile(`(?s).*extra_json.*reserved key.*asset_type.*`),
+			},
 		},
 	})
+}
+
+func testAccAssetResourceConfigWithInvalidMetadataExtraType(name, orchObjID string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  orchestration_metadata = {
+    asset_type         = "F5"
+    f5_device_hostname = "bigip-01.example.com"
+    partition          = "/Common"
+    vs_name            = "vs-main"
+    extra_json         = jsonencode(["bad"])
+  }
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+}
+`, name, orchObjID)
+}
+
+func testAccAssetResourceConfigWithReservedMetadataExtraKey(name, orchObjID string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  orchestration_metadata = {
+    asset_type         = "F5"
+    f5_device_hostname = "bigip-01.example.com"
+    partition          = "/Common"
+    vs_name            = "vs-main"
+    extra_json = jsonencode({
+      asset_type = "OVERRIDE"
+    })
+  }
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+}
+`, name, orchObjID)
 }
 
 func testAccAssetResourceConfig(name, orchObjID string) string {
@@ -178,7 +291,6 @@ resource "guardicore_asset" "test" {
   orchestration_obj_id = %[2]q
   status               = "on"
   comments             = "Test asset comment"
-
   nics = [{
     ip_addresses = ["10.0.0.1", "10.0.0.2"]
     mac_address  = "00:11:22:33:44:55"
@@ -260,7 +372,7 @@ func TestAccAssetResource_serverAssignedLabels(t *testing.T) {
 				ResourceName:            "guardicore_asset.test",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"orchestration_metadata_json", "orchestration_obj_id"},
+				ImportStateVerifyIgnore: []string{"orchestration_metadata", "orchestration_obj_id"},
 			},
 		},
 	})
@@ -282,8 +394,12 @@ func TestAccAssetResource_withLabels(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
 					resource.TestCheckResourceAttr("guardicore_asset.test", "labels.#", "1"),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.0.id",
+					resource.TestCheckTypeSetElemNestedAttrs("guardicore_asset.test", "labels.*", map[string]string{
+						"key":   fmt.Sprintf("tf-acc-asset-label-%s", orchObjID),
+						"value": "test-value",
+					}),
+					resource.TestCheckTypeSetElemAttrPair(
+						"guardicore_asset.test", "labels.*.id",
 						"guardicore_label.test_asset_label", "id",
 					),
 				),
@@ -295,6 +411,65 @@ func TestAccAssetResource_withLabels(t *testing.T) {
 					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
 					resource.TestCheckNoResourceAttr("guardicore_asset.test", "labels.#"),
 				),
+			},
+		},
+	})
+}
+
+func TestAccAssetResource_withExplicitEmptyLabels(t *testing.T) {
+	name := testAccRandomName("tf-acc-asset-emptylbl")
+	orchObjID := testAccRandomName("orch-emptylbl")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAssetResourceConfigWithEmptyLabels(name, orchObjID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "labels.#", "0"),
+				),
+			},
+			{
+				Config:             testAccAssetResourceConfigWithEmptyLabels(name, orchObjID),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
+func TestAccAssetResource_withDynamicLabelIgnored(t *testing.T) {
+	name := testAccRandomName("tf-acc-asset-dynlbl")
+	orchObjID := testAccRandomName("orch-dynlbl")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccAssetResourceConfigWithDynamicLabel(name, orchObjID),
+				ExpectError: regexp.MustCompile(`(?i)dynamic criteria.*cannot be manually assigned`),
+			},
+		},
+	})
+}
+
+func TestAccAssetResource_withReadOnlyLabelRejected(t *testing.T) {
+	name := testAccRandomName("tf-acc-asset-rolbl")
+	orchObjID := testAccRandomName("orch-rolbl")
+	readOnly := testAccReadOnlyLabel(t)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccAssetResourceConfigWithReadOnlyLabel(name, orchObjID, readOnly.ID, readOnly.Key, readOnly.Value),
+				ExpectError: regexp.MustCompile(`(?i)system-managed.*cannot be assigned`),
 			},
 		},
 	})
@@ -325,6 +500,75 @@ resource "guardicore_asset" "test" {
 `, name, orchObjID)
 }
 
+func testAccAssetResourceConfigWithEmptyLabels(name, orchObjID string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+
+  labels = []
+}
+`, name, orchObjID)
+}
+
+func testAccAssetResourceConfigWithDynamicLabel(name, orchObjID string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_label" "test_dynamic_label" {
+  key   = "tf-acc-asset-dyn-%[2]s"
+  value = "test-value"
+
+  criteria = [
+    {
+      field    = "name"
+      op       = "CONTAINS"
+      argument = "%[1]s"
+    }
+  ]
+}
+
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+
+  labels = [{
+    id    = guardicore_label.test_dynamic_label.id
+    key   = guardicore_label.test_dynamic_label.key
+    value = guardicore_label.test_dynamic_label.value
+  }]
+}
+`, name, orchObjID)
+}
+
+func testAccAssetResourceConfigWithReadOnlyLabel(name, orchObjID, labelID, labelKey, labelValue string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+
+  labels = [{
+    id    = %[3]q
+    key   = %[4]q
+    value = %[5]q
+  }]
+}
+`, name, orchObjID, labelID, labelKey, labelValue)
+}
+
 func TestAccAssetResource_withLabelsAllFields(t *testing.T) {
 	name := testAccRandomName("tf-acc-asset-lbl2")
 	orchObjID := testAccRandomName("orch-lbl2")
@@ -340,16 +584,16 @@ func TestAccAssetResource_withLabelsAllFields(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
 					resource.TestCheckResourceAttr("guardicore_asset.test", "labels.#", "1"),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.0.id",
+					resource.TestCheckTypeSetElemAttrPair(
+						"guardicore_asset.test", "labels.*.id",
 						"guardicore_label.test_asset_label", "id",
 					),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.0.key",
+					resource.TestCheckTypeSetElemAttrPair(
+						"guardicore_asset.test", "labels.*.key",
 						"guardicore_label.test_asset_label", "key",
 					),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.0.value",
+					resource.TestCheckTypeSetElemAttrPair(
+						"guardicore_asset.test", "labels.*.value",
 						"guardicore_label.test_asset_label", "value",
 					),
 				),
@@ -392,24 +636,24 @@ func TestAccAssetResource_withMultipleLabels(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
 		Steps: []resource.TestStep{
-			// Create with 3 labels — order must be preserved despite API reordering
+			// Create with 3 labels and verify set membership.
 			{
 				Config: testAccAssetResourceConfigWithMultipleLabels(name, orchObjID),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
 					resource.TestCheckResourceAttr("guardicore_asset.test", "labels.#", "3"),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.0.id",
-						"guardicore_label.label_a", "id",
-					),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.1.id",
-						"guardicore_label.label_b", "id",
-					),
-					resource.TestCheckResourceAttrPair(
-						"guardicore_asset.test", "labels.2.id",
-						"guardicore_label.label_c", "id",
-					),
+					resource.TestCheckTypeSetElemNestedAttrs("guardicore_asset.test", "labels.*", map[string]string{
+						"key":   fmt.Sprintf("tf-acc-lbl-a-%s", orchObjID),
+						"value": "value-a",
+					}),
+					resource.TestCheckTypeSetElemNestedAttrs("guardicore_asset.test", "labels.*", map[string]string{
+						"key":   fmt.Sprintf("tf-acc-lbl-b-%s", orchObjID),
+						"value": "value-b",
+					}),
+					resource.TestCheckTypeSetElemNestedAttrs("guardicore_asset.test", "labels.*", map[string]string{
+						"key":   fmt.Sprintf("tf-acc-lbl-c-%s", orchObjID),
+						"value": "value-c",
+					}),
 				),
 			},
 		},
@@ -594,7 +838,11 @@ resource "guardicore_asset" "test" {
 
 func TestModelLabelsToAPI_Nil(t *testing.T) {
 	r := &AssetResource{}
-	result := r.modelLabelsToAPI(nil)
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), nil, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
 	if result != nil {
 		t.Errorf("expected nil for nil input, got %v", result)
 	}
@@ -602,7 +850,11 @@ func TestModelLabelsToAPI_Nil(t *testing.T) {
 
 func TestModelLabelsToAPI_Empty(t *testing.T) {
 	r := &AssetResource{}
-	result := r.modelLabelsToAPI([]AssetLabelModel{})
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), []AssetLabelModel{}, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
 	if result == nil {
 		t.Fatal("expected non-nil for empty input")
 	}
@@ -625,7 +877,11 @@ func TestModelLabelsToAPI_Populated(t *testing.T) {
 			Value: types.StringValue("web"),
 		},
 	}
-	result := r.modelLabelsToAPI(labels)
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
 	if len(result) != 2 {
 		t.Fatalf("expected 2 items, got %d", len(result))
 	}
@@ -635,6 +891,230 @@ func TestModelLabelsToAPI_Populated(t *testing.T) {
 	if result[1].ID != "id-2" || result[1].Key != "role" || result[1].Value != "web" {
 		t.Errorf("unexpected second label: %+v", result[1])
 	}
+}
+
+func TestModelLabelsToAPI_FiltersReadOnlyLabels(t *testing.T) {
+	r := &AssetResource{}
+	readOnly := true
+	labels := []AssetLabelModel{
+		{
+			ID:       types.StringValue("user-label"),
+			Key:      types.StringValue("Role"),
+			Value:    types.StringValue("Server"),
+			ReadOnly: types.BoolValue(false),
+		},
+		{
+			ID:       types.StringValue("read-only-label"),
+			Key:      types.StringValue("cloud_provider"),
+			Value:    types.StringValue("AWS"),
+			ReadOnly: types.BoolValue(true),
+		},
+		{
+			ID:       types.StringValue("read-only-pointer-label"),
+			Key:      types.StringValue("os_type"),
+			Value:    types.StringValue("Linux"),
+			ReadOnly: boolPointerToTerraform(&readOnly),
+		},
+	}
+
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for read-only labels")
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 user-managed label, got %d", len(result))
+	}
+	if result[0].ID != "user-label" || result[0].Key != "Role" || result[0].Value != "Server" {
+		t.Errorf("unexpected label: %+v", result[0])
+	}
+}
+
+func TestModelLabelsToAPI_FiltersDynamicLabels(t *testing.T) {
+	r := &AssetResource{
+		referenceChecker: &mockReferenceChecker{
+			labels: map[string]*client.Label{
+				"dynamic-label": {
+					ID:              "dynamic-label",
+					DynamicCriteria: []client.LabelCriteria{{Field: "name", Op: "CONTAINS", Argument: "db"}},
+				},
+				"static-label": {
+					ID: "static-label",
+				},
+			},
+		},
+	}
+	labels := []AssetLabelModel{
+		{
+			ID:    types.StringValue("dynamic-label"),
+			Key:   types.StringValue("role"),
+			Value: types.StringValue("database"),
+		},
+		{
+			ID:    types.StringValue("static-label"),
+			Key:   types.StringValue("env"),
+			Value: types.StringValue("prod"),
+		},
+	}
+
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for dynamic labels")
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 user-managed label, got %d", len(result))
+	}
+	if result[0].ID != "static-label" {
+		t.Fatalf("expected static label to remain in payload, got %+v", result[0])
+	}
+}
+
+func TestModelLabelsToAPI_FiltersReadOnlyViaListFallback(t *testing.T) {
+	r := &AssetResource{
+		referenceChecker: &mockReferenceChecker{
+			labels: map[string]*client.Label{
+				"auto-label": {
+					ID:    "auto-label",
+					Key:   "os_type",
+					Value: "Linux",
+				},
+				"static-label": {
+					ID:    "static-label",
+					Key:   "env",
+					Value: "prod",
+				},
+			},
+			listLabels: []client.Label{
+				{
+					ID:       "auto-label",
+					Key:      "os_type",
+					Value:    "Linux",
+					ReadOnly: boolPtrAsset(true),
+				},
+				{
+					ID:    "static-label",
+					Key:   "env",
+					Value: "prod",
+				},
+			},
+		},
+	}
+
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("auto-label"), Key: types.StringValue("os_type"), Value: types.StringValue("Linux")},
+		{ID: types.StringValue("static-label"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+	}
+
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for read-only fallback labels")
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 user-managed label after read-only fallback filtering, got %d", len(result))
+	}
+	if result[0].ID != "static-label" {
+		t.Fatalf("expected static label to remain in payload, got %+v", result[0])
+	}
+}
+
+func TestModelLabelsToAPI_UsesIgnoreCacheAcrossCalls(t *testing.T) {
+	checker := &mockReferenceChecker{
+		labels: map[string]*client.Label{
+			"label-1": {
+				ID:    "label-1",
+				Key:   "env",
+				Value: "prod",
+			},
+		},
+		getLabelCalls: map[string]int{},
+	}
+
+	r := &AssetResource{
+		referenceChecker: checker,
+		ignoreCache:      newAssetLabelIgnoreCache(),
+	}
+
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("label-1"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+	}
+
+	for i := 0; i < 3; i++ {
+		var diags diag.Diagnostics
+		result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diagnostics on call %d: %v", i+1, diags)
+		}
+		if len(result) != 1 {
+			t.Fatalf("expected 1 label on call %d, got %d", i+1, len(result))
+		}
+	}
+
+	if checker.getLabelCalls["label-1"] != 1 {
+		t.Fatalf("expected GetLabel to be called once due to cache, got %d", checker.getLabelCalls["label-1"])
+	}
+}
+
+func TestModelLabelsToAPI_DoesNotCacheLookupErrors(t *testing.T) {
+	checker := &mockReferenceChecker{
+		labelErr:      fmt.Errorf("temporary label lookup failure"),
+		getLabelCalls: map[string]int{},
+	}
+
+	r := &AssetResource{
+		referenceChecker: checker,
+		ignoreCache:      newAssetLabelIgnoreCache(),
+	}
+
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("label-err"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+	}
+
+	for i := 0; i < 2; i++ {
+		var diags diag.Diagnostics
+		result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected error diagnostics on call %d: %v", i+1, diags)
+		}
+		if len(result) != 1 {
+			t.Fatalf("expected label to be kept on lookup failure (fail-open), got %d labels", len(result))
+		}
+
+		warnings := 0
+		for _, d := range diags {
+			if d.Severity() == diag.SeverityWarning {
+				warnings++
+			}
+		}
+		if warnings == 0 {
+			t.Fatalf("expected warning diagnostics on call %d", i+1)
+		}
+	}
+
+	if checker.getLabelCalls["label-err"] != 2 {
+		t.Fatalf("expected GetLabel to be retried when lookup fails, got %d calls", checker.getLabelCalls["label-err"])
+	}
+}
+
+func TestModelLabelsToAPI_InvalidIncompleteLabelFields(t *testing.T) {
+	r := &AssetResource{}
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("id-1"), Key: types.StringValue(""), Value: types.StringValue("prod")},
+	}
+
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for incomplete label fields")
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected no labels in payload when label fields are invalid, got %d", len(result))
+	}
+}
+
+func boolPtrAsset(v bool) *bool {
+	return &v
 }
 
 // Unit tests for apiToModel label filtering
@@ -668,8 +1148,9 @@ func TestApiToModel_ServerAssignedLabelsFiltered(t *testing.T) {
 
 func TestApiToModel_ImportPopulatesLabels(t *testing.T) {
 	// During import, data.Labels is nil and data.Name is null (ImportState only sets ID).
-	// Labels from the API should be populated so they appear in state after import.
+	// Non-read-only labels from the API should be populated so they appear in state after import.
 	r := &AssetResource{}
+	readOnly := true
 	data := &AssetResourceModel{} // Name is null (zero value) — simulates import
 	asset := &client.Asset{
 		ID:     "asset-1",
@@ -677,7 +1158,7 @@ func TestApiToModel_ImportPopulatesLabels(t *testing.T) {
 		Status: "on",
 		Labels: []client.AssetLabelRef{
 			{ID: "lbl-1", Key: "env", Value: "prod"},
-			{ID: "lbl-2", Key: "role", Value: "web"},
+			{ID: "lbl-2", Key: "os_type", Value: "Linux", ReadOnly: &readOnly},
 		},
 	}
 	var diags diag.Diagnostics
@@ -688,11 +1169,161 @@ func TestApiToModel_ImportPopulatesLabels(t *testing.T) {
 	if data.Labels == nil {
 		t.Fatal("expected labels to be populated during import, got nil")
 	}
-	if len(data.Labels) != 2 {
-		t.Fatalf("expected 2 labels, got %d", len(data.Labels))
+	if len(data.Labels) != 1 {
+		t.Fatalf("expected 1 label (auto labels skipped), got %d", len(data.Labels))
 	}
 	if data.Labels[0].ID.ValueString() != "lbl-1" {
 		t.Errorf("expected first label ID 'lbl-1', got %q", data.Labels[0].ID.ValueString())
+	}
+	if data.Labels[0].ReadOnly.ValueBool() {
+		t.Error("expected imported user label read_only=false")
+	}
+}
+
+func TestApiToModel_ImportSkipsIncompleteLabelsWithWarning(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{} // Name is null (zero value) — simulates import
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "lbl-incomplete", Key: "", Value: ""},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if data.Labels != nil {
+		t.Fatalf("expected skipped imported labels to normalize to nil, got %d", len(data.Labels))
+	}
+
+	warningCount := 0
+	for _, d := range diags {
+		if d.Severity() != 1 {
+			warningCount++
+		}
+	}
+	if warningCount == 0 {
+		t.Fatal("expected warning for skipped incomplete imported label")
+	}
+}
+
+func TestApiToModel_ImportDoesNotHydrateIDOnlyLabels(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{} // Name is null (zero value) — simulates import
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "lbl-1", Key: "", Value: ""},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if data.Labels != nil {
+		t.Fatalf("expected id-only imported label to normalize to nil, got %d", len(data.Labels))
+	}
+
+	warningCount := 0
+	for _, d := range diags {
+		if d.Severity() != 1 {
+			warningCount++
+		}
+	}
+	if warningCount == 0 {
+		t.Fatal("expected warning for skipped incomplete imported label")
+	}
+}
+
+func TestApiToModel_ImportReadOnlyLabelsNormalizeToNil(t *testing.T) {
+	r := &AssetResource{}
+	readOnly := true
+	data := &AssetResourceModel{} // Name null simulates import
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "lbl-readonly", Key: "os_type", Value: "Linux", ReadOnly: &readOnly},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if data.Labels != nil {
+		t.Fatalf("expected read-only imported labels to normalize to nil, got %d", len(data.Labels))
+	}
+}
+
+func TestApiToModel_ImportDoesNotHydrateOrchestrationMetadataWhenUnset(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{}
+	asset := &client.Asset{
+		ID:                    "asset-1",
+		Name:                  "test",
+		Status:                "on",
+		OrchestrationMetadata: []byte(`{"asset_type":"F5","f5_device_hostname":"f5-host","partition":"Common","vs_name":"vs-main","Agent":{}}`),
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if !data.OrchestrationMetadata.IsNull() {
+		t.Fatal("expected orchestration_metadata to remain null during import when unset in config")
+	}
+}
+
+func TestApiToModel_UpdatesOrchestrationMetadataWhenConfigured(t *testing.T) {
+	r := &AssetResource{}
+	configuredObj, d := types.ObjectValue(assetOrchestrationMetadataAttrTypes(), map[string]attr.Value{
+		"asset_type":         types.StringValue("F5"),
+		"f5_device_hostname": types.StringValue("configured-host"),
+		"partition":          types.StringValue("Common"),
+		"vs_name":            types.StringValue("configured-vs"),
+		"extra_json":         types.StringNull(),
+	})
+	if d.HasError() {
+		t.Fatalf("unexpected setup diagnostics: %v", d)
+	}
+
+	data := &AssetResourceModel{OrchestrationMetadata: configuredObj}
+	asset := &client.Asset{
+		ID:                    "asset-1",
+		Name:                  "test",
+		Status:                "on",
+		OrchestrationMetadata: []byte(`{"asset_type":"F5","f5_device_hostname":"api-host","partition":"Common","vs_name":"api-vs","Agent":{}}`),
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if data.OrchestrationMetadata.IsNull() {
+		t.Fatal("expected orchestration_metadata to be populated when configured")
+	}
+	attrs := data.OrchestrationMetadata.Attributes()
+	assetType, _ := attrs["asset_type"].(types.String)
+	if assetType.ValueString() != "F5" {
+		t.Fatalf("expected asset_type F5, got %q", assetType.ValueString())
+	}
+	extraJSON, _ := attrs["extra_json"].(types.String)
+	if extraJSON.IsNull() || extraJSON.ValueString() == "" {
+		t.Fatal("expected extra_json to include API-only metadata")
 	}
 }
 
@@ -870,8 +1501,84 @@ func TestApiToModel_UserLabelRemovedServerSide(t *testing.T) {
 	}
 }
 
+func TestApiToModel_DynamicLabelDroppedFromManagedState(t *testing.T) {
+	// Explicitly configured dynamic labels are not assignable and should not be
+	// retained as managed labels when reconciling state from API labels.
+	r := &AssetResource{
+		referenceChecker: &mockReferenceChecker{
+			labels: map[string]*client.Label{
+				"dynamic-label": {
+					ID:              "dynamic-label",
+					DynamicCriteria: []client.LabelCriteria{{Field: "name", Op: "CONTAINS", Argument: "db"}},
+				},
+				"static-label": {ID: "static-label"},
+			},
+		},
+	}
+
+	data := &AssetResourceModel{
+		Labels: []AssetLabelModel{
+			{ID: types.StringValue("dynamic-label"), Key: types.StringValue("role"), Value: types.StringValue("database")},
+			{ID: types.StringValue("static-label"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+		},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "static-label", Key: "", Value: ""},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if len(data.Labels) != 1 {
+		t.Fatalf("expected 1 label (static only), got %d", len(data.Labels))
+	}
+	if data.Labels[0].ID.ValueString() != "static-label" {
+		t.Fatalf("expected static label retained, got %q", data.Labels[0].ID.ValueString())
+	}
+}
+
+func TestApiToModel_RemovedStaticLabelStillRemoved(t *testing.T) {
+	// Non-ignored labels still follow API truth and disappear from state when removed.
+	r := &AssetResource{
+		referenceChecker: &mockReferenceChecker{
+			labels: map[string]*client.Label{
+				"static-label": {ID: "static-label"},
+			},
+		},
+	}
+
+	data := &AssetResourceModel{
+		Labels: []AssetLabelModel{
+			{ID: types.StringValue("static-label"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+		},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if len(data.Labels) != 0 {
+		t.Fatalf("expected removed static label to be dropped, got %d", len(data.Labels))
+	}
+}
+
 func TestApiToModel_UserLabelsEmptyAPIResponse(t *testing.T) {
-	// When user configured labels but API returns none, set empty list.
+	// When user configured labels but API returns none, preserve explicit
+	// empty labels to avoid losing ownership semantics.
 	r := &AssetResource{}
 	data := &AssetResourceModel{
 		Labels: []AssetLabelModel{
@@ -890,9 +1597,321 @@ func TestApiToModel_UserLabelsEmptyAPIResponse(t *testing.T) {
 		t.Fatalf("unexpected errors: %s", diags)
 	}
 	if data.Labels == nil {
-		t.Fatal("expected non-nil labels (empty list), got nil")
+		t.Fatal("expected explicit empty labels, got nil")
 	}
 	if len(data.Labels) != 0 {
-		t.Errorf("expected 0 labels, got %d", len(data.Labels))
+		t.Fatalf("expected 0 labels, got %d", len(data.Labels))
 	}
+}
+
+func TestApiToModel_EmptyConfiguredLabelsRemainNil(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{Labels: []AssetLabelModel{}}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: nil,
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if data.Labels == nil {
+		t.Fatal("expected explicit empty labels to remain empty, got nil")
+	}
+	if len(data.Labels) != 0 {
+		t.Fatalf("expected explicit empty labels to remain empty, got %d", len(data.Labels))
+	}
+}
+
+func TestAccAssetResource_multipleResources(t *testing.T) {
+	name1 := testAccRandomName("tf-acc-asset-m1")
+	name2 := testAccRandomName("tf-acc-asset-m2")
+	orch1 := testAccRandomName("orch-m1")
+	orch2 := testAccRandomName("orch-m2")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{{
+			Config: testAccAssetResourceConfigMultiple(name1, orch1, name2, orch2),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttrSet("guardicore_asset.test1", "id"),
+				resource.TestCheckResourceAttrSet("guardicore_asset.test2", "id"),
+			),
+		}},
+	})
+}
+
+func testAccAssetResourceConfigMultiple(name1, orch1, name2, orch2 string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test1" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.0.1.1"]
+    mac_address  = "00:11:22:33:44:71"
+  }]
+}
+
+resource "guardicore_asset" "test2" {
+  name                 = %[3]q
+  orchestration_obj_id = %[4]q
+
+  nics = [{
+    ip_addresses = ["10.0.1.2"]
+    mac_address  = "00:11:22:33:44:72"
+  }]
+}
+`, name1, orch1, name2, orch2)
+}
+
+// Unit tests for NIC filtering in apiToModel
+
+func TestApiToModel_FiltersEmptyIPNics(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Name: types.StringValue("test"),
+		Nics: []NICModel{},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Nics: []client.AssetNIC{
+			{MacAddress: "AA:BB:CC:DD:EE:01", IPAddresses: []string{"10.0.0.1"}},
+			{MacAddress: "AA:BB:CC:DD:EE:02", IPAddresses: []string{}},
+			{MacAddress: "AA:BB:CC:DD:EE:03", IPAddresses: []string{"10.0.0.3", "10.0.0.4"}},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+
+	if len(data.Nics) != 2 {
+		t.Fatalf("expected 2 valid NICs, got %d", len(data.Nics))
+	}
+	if data.Nics[0].MacAddress.ValueString() != "AA:BB:CC:DD:EE:01" {
+		t.Errorf("expected first NIC MAC AA:BB:CC:DD:EE:01, got %q", data.Nics[0].MacAddress.ValueString())
+	}
+	if data.Nics[1].MacAddress.ValueString() != "AA:BB:CC:DD:EE:03" {
+		t.Errorf("expected second NIC MAC AA:BB:CC:DD:EE:03, got %q", data.Nics[1].MacAddress.ValueString())
+	}
+
+	warningCount := 0
+	for _, d := range diags {
+		if d.Severity() == diag.SeverityWarning {
+			warningCount++
+		}
+	}
+	if warningCount != 1 {
+		t.Errorf("expected 1 warning for filtered NIC, got %d", warningCount)
+	}
+}
+
+func TestApiToModel_AllNicsEmptyIP(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Name: types.StringValue("test"),
+		Nics: []NICModel{},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Nics: []client.AssetNIC{
+			{MacAddress: "AA:BB:CC:DD:EE:01", IPAddresses: []string{}},
+			{MacAddress: "AA:BB:CC:DD:EE:02", IPAddresses: nil},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+
+	if len(data.Nics) != 0 {
+		t.Fatalf("expected 0 valid NICs, got %d", len(data.Nics))
+	}
+
+	warningCount := 0
+	for _, d := range diags {
+		if d.Severity() == diag.SeverityWarning {
+			warningCount++
+		}
+	}
+	// 2 per-NIC warnings + 1 "all NICs invalid" warning
+	if warningCount != 3 {
+		t.Errorf("expected 3 warnings (2 per-NIC + 1 all-invalid), got %d", warningCount)
+	}
+}
+
+func TestApiToModel_NilIPAddressesFiltered(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Name: types.StringValue("test"),
+		Nics: []NICModel{},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Nics: []client.AssetNIC{
+			{MacAddress: "AA:BB:CC:DD:EE:01", IPAddresses: nil},
+			{MacAddress: "AA:BB:CC:DD:EE:02", IPAddresses: []string{"10.0.0.1"}},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+
+	if len(data.Nics) != 1 {
+		t.Fatalf("expected 1 valid NIC, got %d", len(data.Nics))
+	}
+	if data.Nics[0].MacAddress.ValueString() != "AA:BB:CC:DD:EE:02" {
+		t.Errorf("expected NIC MAC AA:BB:CC:DD:EE:02, got %q", data.Nics[0].MacAddress.ValueString())
+	}
+}
+
+func TestApiToModel_AllNicsValidNoWarnings(t *testing.T) {
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Name: types.StringValue("test"),
+		Nics: []NICModel{},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Nics: []client.AssetNIC{
+			{MacAddress: "AA:BB:CC:DD:EE:01", IPAddresses: []string{"10.0.0.1"}},
+			{MacAddress: "AA:BB:CC:DD:EE:02", IPAddresses: []string{"10.0.0.2"}},
+		},
+	}
+
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+
+	if len(data.Nics) != 2 {
+		t.Fatalf("expected 2 NICs, got %d", len(data.Nics))
+	}
+
+	warningCount := 0
+	for _, d := range diags {
+		if d.Severity() == diag.SeverityWarning {
+			warningCount++
+		}
+	}
+	if warningCount != 0 {
+		t.Errorf("expected no warnings for valid NICs, got %d", warningCount)
+	}
+}
+
+// Acceptance test: create an asset normally, then verify NIC filtering works
+// during read. The unit tests cover empty-IP filtering directly, but this
+// acceptance test exercises the full create-read-update-import cycle.
+
+func TestAccAssetResource_importExternalAsset(t *testing.T) {
+	if testConfig == nil {
+		t.Skip("test config not loaded")
+	}
+
+	apiConfig := client.Config{
+		BaseURL:            testConfig.BaseURL,
+		Username:           testConfig.Username,
+		Password:           testConfig.Password,
+		AccessToken:        testConfig.AccessToken,
+		RefreshToken:       testConfig.RefreshToken,
+		InsecureSkipVerify: testConfig.InsecureSkipVerify,
+	}
+	apiClient, err := client.NewClient(apiConfig)
+	if err != nil {
+		t.Fatalf("failed to create API client: %s", err)
+	}
+
+	ctx := context.Background()
+	orchObjID := testAccRandomName("orch-ext")
+	assetName := testAccRandomName("tf-acc-asset-ext")
+
+	// Create an asset via the API directly (simulating external creation).
+	createResp, err := apiClient.BulkCreateAssets(ctx, []client.AssetCreate{
+		{
+			Name:               assetName,
+			OrchestrationObjID: orchObjID,
+			Nics: []client.AssetNIC{
+				{MacAddress: "AA:BB:CC:11:22:01", IPAddresses: []string{"10.88.0.1"}},
+				{MacAddress: "AA:BB:CC:11:22:02", IPAddresses: []string{"10.88.0.2"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to create test asset: %s", err)
+	}
+
+	assetID := createResp.CreatedAssetIDs[orchObjID]
+	if assetID == "" {
+		t.Fatal("failed to extract asset ID from create response")
+	}
+
+	t.Cleanup(func() {
+		_ = apiClient.BulkDeactivateAssets(context.Background(), []string{assetID})
+	})
+
+	// Import the externally-created asset into Terraform.
+	// This exercises the Read (apiToModel) path including NIC conversion.
+	// After import, the orch_obj_id is not in state (API doesn't return it),
+	// so we only verify import succeeds — a subsequent apply would require
+	// replacement which we test separately in _basic.
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:            testAccAssetResourceConfigForImport(assetName, orchObjID),
+				ResourceName:      "guardicore_asset.test",
+				ImportState:       true,
+				ImportStateId:     assetID,
+				ImportStateVerify: false, // orch_obj_id and orch_metadata not returned by API
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "name", assetName),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "nics.#", "2"),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "nics.0.ip_addresses.#", "1"),
+				),
+			},
+		},
+	})
+}
+
+func testAccAssetResourceConfigForImport(name, orchObjID string) string {
+	return testAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.88.0.1"]
+    mac_address  = "AA:BB:CC:11:22:01"
+  },
+  {
+    ip_addresses = ["10.88.0.2"]
+    mac_address  = "AA:BB:CC:11:22:02"
+  }]
+}
+`, name, orchObjID)
 }

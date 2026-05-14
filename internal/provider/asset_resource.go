@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
@@ -30,7 +29,12 @@ func NewAssetResource() resource.Resource {
 
 // AssetResource defines the resource implementation.
 type AssetResource struct {
-	client *client.Client
+	client           *client.Client
+	referenceChecker ReferenceChecker
+	ignoreCache      *assetLabelIgnoreCache
+	createBatcher    *Batcher[*client.AssetCreate, string]
+	updateBatcher    *Batcher[*client.AssetBulkUpdateItem, struct{}]
+	deleteBatcher    *Batcher[string, struct{}]
 }
 
 // NICModel describes a network interface within an asset.
@@ -47,27 +51,28 @@ type NICModel struct {
 
 // AssetLabelModel describes a label reference on an asset.
 type AssetLabelModel struct {
-	ID    types.String `tfsdk:"id"`
-	Key   types.String `tfsdk:"key"`
-	Value types.String `tfsdk:"value"`
+	ID       types.String `tfsdk:"id"`
+	Key      types.String `tfsdk:"key"`
+	Value    types.String `tfsdk:"value"`
+	ReadOnly types.Bool   `tfsdk:"read_only"`
 }
 
 // AssetResourceModel describes the resource data model.
 type AssetResourceModel struct {
-	ID                        types.String      `tfsdk:"id"`
-	Name                      types.String      `tfsdk:"name"`
-	Nics                      []NICModel        `tfsdk:"nics"`
-	OrchestrationObjID        types.String      `tfsdk:"orchestration_obj_id"`
-	Status                    types.String      `tfsdk:"status"`
-	Labels                    []AssetLabelModel `tfsdk:"labels"`
-	Comments                  types.String      `tfsdk:"comments"`
-	OrchestrationMetadataJSON types.String      `tfsdk:"orchestration_metadata_json"`
-	WorksiteID                types.String      `tfsdk:"worksite_id"`
-	InstanceID                types.String      `tfsdk:"instance_id"`
-	HwUUID                    types.String      `tfsdk:"hw_uuid"`
-	BiosUUID                  types.String      `tfsdk:"bios_uuid"`
-	FirstSeen                 types.String      `tfsdk:"first_seen"`
-	LastSeen                  types.String      `tfsdk:"last_seen"`
+	ID                    types.String      `tfsdk:"id"`
+	Name                  types.String      `tfsdk:"name"`
+	Nics                  []NICModel        `tfsdk:"nics"`
+	OrchestrationObjID    types.String      `tfsdk:"orchestration_obj_id"`
+	Status                types.String      `tfsdk:"status"`
+	Labels                []AssetLabelModel `tfsdk:"labels"`
+	Comments              types.String      `tfsdk:"comments"`
+	OrchestrationMetadata types.Object      `tfsdk:"orchestration_metadata"`
+	WorksiteID            types.String      `tfsdk:"worksite_id"`
+	InstanceID            types.String      `tfsdk:"instance_id"`
+	HwUUID                types.String      `tfsdk:"hw_uuid"`
+	BiosUUID              types.String      `tfsdk:"bios_uuid"`
+	FirstSeen             types.String      `tfsdk:"first_seen"`
+	LastSeen              types.String      `tfsdk:"last_seen"`
 }
 
 func (r *AssetResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -79,6 +84,9 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 		MarkdownDescription: "Manages an asset in Akamai Guardicore Segmentation. Assets represent network entities with network interfaces (NICs), labels, and orchestration metadata.\n\n" +
 			"~> **Note:** The API DELETE operation deactivates the asset (sets status to `deleted`) rather than permanently removing it. " +
 			"Deactivated assets may still appear in the Akamai Guardicore Segmentation management UI.\n\n" +
+			"~> **Labels Behavior:** The `labels` attribute manages only explicitly configured, assignable labels for this asset. " +
+			"Labels marked `read_only = true` and labels with dynamic criteria are not assignable and will be rejected during plan/apply validation. " +
+			"Omit `labels` to opt out of Terraform label management for an asset. Set `labels = []` to explicitly manage zero assignable labels.\n\n" +
 			"~> **Reference Validation:** Label IDs in the `labels` block and the `worksite_id` are validated for existence in Akamai Guardicore Segmentation during plan and apply. " +
 			"Non-existent IDs will produce a clear error before any API call is made.",
 
@@ -190,9 +198,9 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 					stringvalidator.OneOf("on", "off", "deleted"),
 				},
 			},
-			"labels": schema.ListNestedAttribute{
+			"labels": schema.SetNestedAttribute{
 				Optional:            true,
-				MarkdownDescription: "List of labels assigned to the asset. Each label requires `id`, `key`, and `value` — the API needs all three. Reference a managed label via `guardicore_label.<name>.id`, `.key`, and `.value`. Use the `guardicore_label` data source for labels not managed by Terraform. Note: the server may automatically assign additional labels (e.g., \"Agent: Not Installed\"), but only user-specified labels are tracked in Terraform state.",
+				MarkdownDescription: "Set of Terraform-managed labels assigned to the asset. Each label requires `id`, `key`, and `value` — the API needs all three. Reference a managed label via `guardicore_label.<name>.id`, `.key`, and `.value`. Use the `guardicore_label` data source for labels not managed by Terraform. Labels marked `read_only = true` and labels with dynamic criteria are system-managed and cannot be assigned in `guardicore_asset.labels` (validation error). Omit this attribute to avoid Terraform label management for the asset; set `labels = []` to manage zero assignable labels.",
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"id": schema.StringAttribute{
@@ -207,6 +215,13 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 							Required:            true,
 							MarkdownDescription: "The label value. Use `guardicore_label.<name>.value` to reference a managed label.",
 						},
+						"read_only": schema.BoolAttribute{
+							Computed:            true,
+							MarkdownDescription: "Whether the label is read-only and managed by the server. Read-only labels and labels with dynamic criteria cannot be assigned in `guardicore_asset.labels`.",
+							PlanModifiers: []planmodifier.Bool{
+								boolplanmodifier.UseStateForUnknown(),
+							},
+						},
 					},
 				},
 			},
@@ -214,11 +229,7 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 				Optional:            true,
 				MarkdownDescription: "Additional asset comments.",
 			},
-			"orchestration_metadata_json": schema.StringAttribute{
-				Optional: true,
-				MarkdownDescription: "Orchestration metadata as a JSON string. Use `jsonencode()` to encode. " +
-					"Known fields: `asset_type` (e.g., `F5`), `f5_device_hostname`, `partition`, `vs_name`.",
-			},
+			"orchestration_metadata": assetOrchestrationMetadataResourceSchemaAttribute(),
 			"worksite_id": schema.StringAttribute{
 				Optional:            true,
 				Computed:            true,
@@ -242,9 +253,8 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 				},
 			},
 			"bios_uuid": schema.StringAttribute{
-				Optional:            true,
 				Computed:            true,
-				MarkdownDescription: "BIOS UUID.",
+				MarkdownDescription: "BIOS UUID reported by the API.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
@@ -259,6 +269,9 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 			"last_seen": schema.StringAttribute{
 				Computed:            true,
 				MarkdownDescription: "Timestamp when the asset was last seen.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 		},
 	}
@@ -279,6 +292,11 @@ func (r *AssetResource) Configure(ctx context.Context, req resource.ConfigureReq
 	}
 
 	r.client = providerData.Client
+	r.referenceChecker = providerData.Client
+	r.ignoreCache = providerData.AssetLabelIgnoreCache
+	r.createBatcher = providerData.AssetCreateBatcher
+	r.updateBatcher = providerData.AssetUpdateBatcher
+	r.deleteBatcher = providerData.AssetDeleteBatcher
 }
 
 func (r *AssetResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -302,7 +320,7 @@ func (r *AssetResource) Create(ctx context.Context, req resource.CreateRequest, 
 		return
 	}
 
-	id, err := r.client.CreateAsset(ctx, apiReq)
+	id, err := r.createBatcher.Enqueue(ctx, apiReq)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create asset, got error: %s", err))
 		return
@@ -323,15 +341,15 @@ func (r *AssetResource) Create(ctx context.Context, req resource.CreateRequest, 
 		}
 	}
 
-	// Read back to populate server-computed fields
-	created, err := r.client.GetAsset(ctx, id)
+	// Read back to populate server-computed fields (with eventual consistency retries)
+	created, err := waitForReadAfterCreate(ctx, "asset", func(ctx context.Context) (*client.Asset, error) {
+		return r.client.GetAsset(ctx, id)
+	})
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read asset after creation, got error: %s", err))
 		return
 	}
-	if created != nil {
-		r.apiToModel(ctx, created, &data, &resp.Diagnostics)
-	}
+	r.apiToModel(ctx, created, &data, &resp.Diagnostics)
 
 	tflog.Trace(ctx, "created asset", map[string]any{"id": id})
 
@@ -383,7 +401,7 @@ func (r *AssetResource) Update(ctx context.Context, req resource.UpdateRequest, 
 		return
 	}
 
-	err := r.client.UpdateAsset(ctx, data.ID.ValueString(), apiReq)
+	_, err := r.updateBatcher.Enqueue(ctx, apiReq)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update asset, got error: %s", err))
 		return
@@ -445,7 +463,7 @@ func (r *AssetResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 		return
 	}
 
-	err := r.client.BulkDeactivateAssets(ctx, []string{data.ID.ValueString()})
+	_, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to deactivate asset, got error: %s", err))
 		return
@@ -461,13 +479,15 @@ func (r *AssetResource) ImportState(ctx context.Context, req resource.ImportStat
 // modelToCreateAPI converts the Terraform model to API struct for create.
 func (r *AssetResource) modelToCreateAPI(ctx context.Context, data *AssetResourceModel, diags *diag.Diagnostics) *client.AssetCreate {
 	nics := r.modelNicsToAPI(ctx, data.Nics, diags)
-	labels := r.modelLabelsToAPI(data.Labels)
+	labels := r.modelLabelsToAPI(ctx, data.Labels, diags)
 
 	result := &client.AssetCreate{
 		Name:               data.Name.ValueString(),
 		Nics:               nics,
 		OrchestrationObjID: data.OrchestrationObjID.ValueString(),
-		Labels:             labels,
+	}
+	if labels != nil {
+		result.Labels = &labels
 	}
 
 	if !data.Status.IsNull() && !data.Status.IsUnknown() {
@@ -476,8 +496,13 @@ func (r *AssetResource) modelToCreateAPI(ctx context.Context, data *AssetResourc
 	if !data.Comments.IsNull() && !data.Comments.IsUnknown() {
 		result.Comments = data.Comments.ValueString()
 	}
-	if !data.OrchestrationMetadataJSON.IsNull() && !data.OrchestrationMetadataJSON.IsUnknown() {
-		result.OrchestrationMetadata = json.RawMessage(data.OrchestrationMetadataJSON.ValueString())
+	if !data.OrchestrationMetadata.IsNull() && !data.OrchestrationMetadata.IsUnknown() {
+		metadata, d := buildAssetOrchestrationMetadataJSON(ctx, data.OrchestrationMetadata)
+		diags.Append(d...)
+		if diags.HasError() {
+			return result
+		}
+		result.OrchestrationMetadata = metadata
 	}
 	if !data.InstanceID.IsNull() && !data.InstanceID.IsUnknown() {
 		result.InstanceID = data.InstanceID.ValueString()
@@ -485,22 +510,22 @@ func (r *AssetResource) modelToCreateAPI(ctx context.Context, data *AssetResourc
 	if !data.HwUUID.IsNull() && !data.HwUUID.IsUnknown() {
 		result.HwUUID = data.HwUUID.ValueString()
 	}
-	if !data.BiosUUID.IsNull() && !data.BiosUUID.IsUnknown() {
-		result.BiosUUID = data.BiosUUID.ValueString()
-	}
 	return result
 }
 
-// modelToUpdateAPI converts the Terraform model to API struct for update.
-// NOTE: orchestration_obj_id, instance_id, hw_uuid, bios_uuid are NOT in the edit body.
-func (r *AssetResource) modelToUpdateAPI(ctx context.Context, data *AssetResourceModel, diags *diag.Diagnostics) *client.AssetUpdate {
+// modelToUpdateAPI converts the Terraform model to API struct for bulk update.
+// NOTE: orchestration_obj_id, instance_id, and hw_uuid are NOT in the edit body.
+func (r *AssetResource) modelToUpdateAPI(ctx context.Context, data *AssetResourceModel, diags *diag.Diagnostics) *client.AssetBulkUpdateItem {
 	nics := r.modelNicsToAPI(ctx, data.Nics, diags)
-	labels := r.modelLabelsToAPI(data.Labels)
+	labels := r.modelLabelsToAPI(ctx, data.Labels, diags)
 
-	result := &client.AssetUpdate{
-		Name:   data.Name.ValueString(),
-		Nics:   nics,
-		Labels: labels,
+	result := &client.AssetBulkUpdateItem{
+		AssetID: data.ID.ValueString(),
+		Name:    data.Name.ValueString(),
+		Nics:    nics,
+	}
+	if labels != nil {
+		result.Labels = &labels
 	}
 
 	if !data.Status.IsNull() && !data.Status.IsUnknown() {
@@ -509,8 +534,13 @@ func (r *AssetResource) modelToUpdateAPI(ctx context.Context, data *AssetResourc
 	if !data.Comments.IsNull() && !data.Comments.IsUnknown() {
 		result.Comments = data.Comments.ValueString()
 	}
-	if !data.OrchestrationMetadataJSON.IsNull() && !data.OrchestrationMetadataJSON.IsUnknown() {
-		result.OrchestrationMetadata = json.RawMessage(data.OrchestrationMetadataJSON.ValueString())
+	if !data.OrchestrationMetadata.IsNull() && !data.OrchestrationMetadata.IsUnknown() {
+		metadata, d := buildAssetOrchestrationMetadataJSON(ctx, data.OrchestrationMetadata)
+		diags.Append(d...)
+		if diags.HasError() {
+			return result
+		}
+		result.OrchestrationMetadata = metadata
 	}
 	return result
 }
@@ -543,7 +573,8 @@ func (r *AssetResource) modelNicsToAPI(ctx context.Context, nics []NICModel, dia
 			apiNic.IsCloudPublic = &v
 		}
 		if !nic.IsCorporateInterface.IsNull() && !nic.IsCorporateInterface.IsUnknown() {
-			apiNic.IsCorporateInterface = nic.IsCorporateInterface.ValueBool()
+			v := nic.IsCorporateInterface.ValueBool()
+			apiNic.IsCorporateInterface = &v
 		}
 		if !nic.SwitchID.IsNull() && !nic.SwitchID.IsUnknown() {
 			apiNic.SwitchID = nic.SwitchID.ValueString()
@@ -555,19 +586,138 @@ func (r *AssetResource) modelNicsToAPI(ctx context.Context, nics []NICModel, dia
 }
 
 // modelLabelsToAPI converts label models to API structs.
-func (r *AssetResource) modelLabelsToAPI(labels []AssetLabelModel) []client.AssetLabelRef {
+func (r *AssetResource) modelLabelsToAPI(ctx context.Context, labels []AssetLabelModel, diags *diag.Diagnostics) []client.AssetLabelRef {
 	if labels == nil {
 		return nil
 	}
-	apiLabels := make([]client.AssetLabelRef, len(labels))
+	apiLabels := make([]client.AssetLabelRef, 0, len(labels))
 	for i, l := range labels {
-		apiLabels[i] = client.AssetLabelRef{
+		if l.ID.IsNull() || l.ID.IsUnknown() || l.ID.ValueString() == "" ||
+			l.Key.IsNull() || l.Key.IsUnknown() || l.Key.ValueString() == "" ||
+			l.Value.IsNull() || l.Value.IsUnknown() || l.Value.ValueString() == "" {
+			diags.AddError(
+				"Invalid Asset Label Configuration",
+				fmt.Sprintf("labels[%d] must include non-empty id, key, and value.", i),
+			)
+			continue
+		}
+
+		if r.isAssetIgnoredLabel(ctx, l, diags) {
+			diags.AddError(
+				"Invalid Asset Label Configuration",
+				fmt.Sprintf("Label %q in labels[%d] is read-only or dynamic and cannot be managed in guardicore_asset.labels. Remove it from configuration; server-managed labels are preserved automatically.", l.ID.ValueString(), i),
+			)
+			continue
+		}
+
+		apiLabels = append(apiLabels, client.AssetLabelRef{
 			ID:    l.ID.ValueString(),
 			Key:   l.Key.ValueString(),
 			Value: l.Value.ValueString(),
-		}
+		})
 	}
 	return apiLabels
+}
+
+func (r *AssetResource) isAssetIgnoredLabel(ctx context.Context, label AssetLabelModel, diags *diag.Diagnostics) bool {
+	if isAssetReadOnlyLabel(label) {
+		return true
+	}
+
+	if label.ID.IsNull() || label.ID.IsUnknown() || label.ID.ValueString() == "" || r.referenceChecker == nil {
+		return false
+	}
+
+	labelID := label.ID.ValueString()
+	if r.ignoreCache != nil {
+		if ignored, ok := r.ignoreCache.Get(labelID); ok {
+			return ignored
+		}
+	}
+
+	apiLabel, err := r.referenceChecker.GetLabel(ctx, labelID)
+	if err != nil {
+		diags.AddWarning(
+			"Unable to Determine Asset Label Ignore Status",
+			fmt.Sprintf("Unable to check whether label %q should be ignored for asset payload reconciliation: %s", labelID, err),
+		)
+		return false
+	}
+
+	if apiLabel == nil {
+		return false
+	}
+
+	if apiLabel.ReadOnly == nil && apiLabel.Key != "" && apiLabel.Value != "" {
+		labels, listErr := r.referenceChecker.ListLabels(ctx, apiLabel.Key, apiLabel.Value)
+		if listErr != nil {
+			diags.AddWarning(
+				"Unable to Determine Asset Label Ignore Status",
+				fmt.Sprintf("Unable to list labels while resolving read-only status for label %q: %s", labelID, listErr),
+			)
+		} else {
+			for _, candidate := range labels {
+				if candidate.ID == labelID {
+					apiLabel.ReadOnly = candidate.ReadOnly
+					if len(apiLabel.DynamicCriteria) == 0 && len(candidate.DynamicCriteria) > 0 {
+						apiLabel.DynamicCriteria = candidate.DynamicCriteria
+					}
+					break
+				}
+			}
+		}
+	}
+
+	ignored := (apiLabel.ReadOnly != nil && *apiLabel.ReadOnly) || len(apiLabel.DynamicCriteria) > 0
+
+	if r.ignoreCache != nil {
+		r.ignoreCache.Set(labelID, ignored)
+	}
+
+	return ignored
+}
+
+func assetLabelModelFromAPI(apiLabel client.AssetLabelRef, existing *AssetLabelModel) AssetLabelModel {
+	model := AssetLabelModel{
+		ID:       types.StringValue(apiLabel.ID),
+		Key:      types.StringValue(apiLabel.Key),
+		Value:    types.StringValue(apiLabel.Value),
+		ReadOnly: boolPointerToTerraform(apiLabel.ReadOnly),
+	}
+	if existing != nil {
+		model = *existing
+		if model.ID.IsNull() || model.ID.IsUnknown() || model.ID.ValueString() == "" {
+			model.ID = types.StringValue(apiLabel.ID)
+		}
+		if model.Key.IsNull() || model.Key.IsUnknown() || model.Key.ValueString() == "" {
+			model.Key = types.StringValue(apiLabel.Key)
+		}
+		if model.Value.IsNull() || model.Value.IsUnknown() || model.Value.ValueString() == "" {
+			model.Value = types.StringValue(apiLabel.Value)
+		}
+		if model.ReadOnly.IsNull() || model.ReadOnly.IsUnknown() {
+			model.ReadOnly = boolPointerToTerraform(apiLabel.ReadOnly)
+		}
+	}
+
+	return model
+}
+
+func hasCompleteAssetLabelFields(label AssetLabelModel) bool {
+	return !label.ID.IsNull() && !label.ID.IsUnknown() && label.ID.ValueString() != "" &&
+		!label.Key.IsNull() && !label.Key.IsUnknown() && label.Key.ValueString() != "" &&
+		!label.Value.IsNull() && !label.Value.IsUnknown() && label.Value.ValueString() != ""
+}
+
+func boolPointerToTerraform(value *bool) types.Bool {
+	if value == nil {
+		return types.BoolNull()
+	}
+	return types.BoolValue(*value)
+}
+
+func isAssetReadOnlyLabel(label AssetLabelModel) bool {
+	return !label.ReadOnly.IsNull() && !label.ReadOnly.IsUnknown() && label.ReadOnly.ValueBool()
 }
 
 // apiToModel converts the API struct to Terraform model.
@@ -580,7 +730,7 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 	data.Name = types.StringValue(asset.Name)
 	data.Status = types.StringValue(asset.Status)
 
-	// For optional create-only fields, only set if API returns a non-empty value.
+	// For fields that are API-populated or create-only, only set if API returns a non-empty value.
 	// Otherwise preserve the existing plan value (null if user didn't set it).
 	if asset.BiosUUID != "" {
 		data.BiosUUID = types.StringValue(asset.BiosUUID)
@@ -610,26 +760,61 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 		data.Comments = types.StringNull()
 	}
 
-	// Convert NICs — always set to a known value
-	nics := make([]NICModel, len(asset.Nics))
-	for i, nic := range asset.Nics {
+	// Filter out NICs with empty ip_addresses before converting. The API may
+	// return such NICs for agent-reported assets (e.g., vSphere). They cannot
+	// be represented in the schema (ip_addresses requires SizeAtLeast(1)) and
+	// would be rejected by the API on the next update.
+	validAPInicsList := make([]client.AssetNIC, 0, len(asset.Nics))
+	for _, nic := range asset.Nics {
+		if len(nic.IPAddresses) > 0 {
+			validAPInicsList = append(validAPInicsList, nic)
+		} else {
+			tflog.Warn(ctx, "dropping NIC with empty ip_addresses from state",
+				map[string]any{"asset_id": asset.ID, "mac_address": nic.MacAddress, "vif_id": nic.VifID})
+			diags.AddWarning(
+				"NIC with Empty IP Addresses Excluded",
+				fmt.Sprintf("Asset %q has a NIC (MAC: %s) with no IP addresses. "+
+					"This NIC was excluded from Terraform state because the provider requires at least one IP address per NIC. "+
+					"The NIC will not be managed by Terraform. If NICs are updated, the API replaces all NICs, "+
+					"which will remove this unmanaged NIC from the server.",
+					asset.ID, nic.MacAddress),
+			)
+		}
+	}
+
+	if len(validAPInicsList) == 0 && len(asset.Nics) > 0 {
+		diags.AddWarning(
+			"Asset Has No Valid NICs",
+			fmt.Sprintf("Asset %q has %d NIC(s) but none have valid IP addresses. "+
+				"This asset cannot be fully managed by Terraform until at least one NIC has a valid IP address.",
+				asset.ID, len(asset.Nics)),
+		)
+	}
+
+	nics := make([]NICModel, len(validAPInicsList))
+	for i, nic := range validAPInicsList {
 		ipList, d := types.ListValueFrom(ctx, types.StringType, nic.IPAddresses)
 		diags.Append(d...)
 
 		nics[i] = NICModel{
-			VifID:                types.StringValue(nic.VifID),
-			MacAddress:           types.StringValue(nic.MacAddress),
-			NetworkID:            types.StringValue(nic.NetworkID),
-			NetworkName:          types.StringValue(nic.NetworkName),
-			IsCorporateInterface: types.BoolValue(nic.IsCorporateInterface),
-			SwitchID:             types.StringValue(nic.SwitchID),
-			IPAddresses:          ipList,
+			VifID:       types.StringValue(nic.VifID),
+			MacAddress:  types.StringValue(nic.MacAddress),
+			NetworkID:   types.StringValue(nic.NetworkID),
+			NetworkName: types.StringValue(nic.NetworkName),
+			SwitchID:    types.StringValue(nic.SwitchID),
+			IPAddresses: ipList,
 		}
 
 		if nic.IsCloudPublic != nil {
 			nics[i].IsCloudPublic = types.BoolValue(*nic.IsCloudPublic)
 		} else {
 			nics[i].IsCloudPublic = types.BoolValue(false)
+		}
+
+		if nic.IsCorporateInterface != nil {
+			nics[i].IsCorporateInterface = types.BoolValue(*nic.IsCorporateInterface)
+		} else {
+			nics[i].IsCorporateInterface = types.BoolValue(false)
 		}
 	}
 	data.Nics = nics
@@ -651,51 +836,70 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 			apiByID[l.ID] = true
 		}
 
-		// Iterate in plan order, keeping only labels confirmed by the API.
-		// This preserves the user's declared ordering (the API may return
-		// labels in a different order, e.g., by creation timestamp).
-		var filtered []AssetLabelModel
+		// Iterate over configured labels, keeping only labels confirmed by the API.
+		// labels is a set attribute, so ordering is intentionally not relied on.
+		filtered := make([]AssetLabelModel, 0, len(data.Labels))
 		for _, pl := range data.Labels {
-			if apiByID[pl.ID.ValueString()] {
-				filtered = append(filtered, pl)
+			id := pl.ID.ValueString()
+			if apiByID[id] {
+				apiLabel := client.AssetLabelRef{ID: id}
+				for _, l := range asset.Labels {
+					if l.ID == id {
+						apiLabel = l
+						break
+					}
+				}
+				filtered = append(filtered, assetLabelModelFromAPI(apiLabel, &pl))
 			}
 		}
-		if filtered != nil {
-			data.Labels = filtered
-		} else {
-			data.Labels = []AssetLabelModel{}
-		}
+		data.Labels = filtered
 	} else if len(asset.Labels) > 0 && isImport {
 		// Import scenario: data.Labels is nil and data.Name was null before
 		// apiToModel (ImportState only sets the ID). Populate labels from the
 		// API response so they appear in state, allowing Terraform to reconcile
 		// with config. We do NOT populate labels during normal Read when the
 		// user didn't configure labels — that would track server-assigned labels.
-		imported := make([]AssetLabelModel, len(asset.Labels))
-		for i, l := range asset.Labels {
-			imported[i] = AssetLabelModel{
-				ID:    types.StringValue(l.ID),
-				Key:   types.StringValue(l.Key),
-				Value: types.StringValue(l.Value),
+		//
+		// Intentionally do NOT hydrate missing label details via GetLabel during
+		// import. Import should stay aligned with importer output and include only
+		// labels that are fully present in the asset API response.
+		imported := make([]AssetLabelModel, 0, len(asset.Labels))
+		for _, l := range asset.Labels {
+			label := assetLabelModelFromAPI(l, nil)
+
+			if r.isAssetIgnoredLabel(ctx, label, diags) {
+				continue
 			}
+
+			if !hasCompleteAssetLabelFields(label) {
+				diags.AddWarning(
+					"Skipping Incomplete Imported Asset Label",
+					fmt.Sprintf("Skipping imported asset label %q because key/value could not be resolved from the API. Add this label manually in configuration if it should be managed by Terraform.", label.ID.ValueString()),
+				)
+				continue
+			}
+
+			imported = append(imported, label)
 		}
-		data.Labels = imported
+		if len(imported) > 0 {
+			data.Labels = imported
+		} else {
+			data.Labels = nil
+		}
 	}
 	// When data.Labels is nil (user didn't configure labels) and this is not
 	// an import, keep nil. Server-assigned labels are not tracked.
 
-	// Convert OrchestrationMetadata — only update if user explicitly set it in config.
-	// The API may populate this server-side, but we should not reflect that back
-	// if the user didn't configure it (it would cause inconsistent result errors).
-	if !data.OrchestrationMetadataJSON.IsNull() && !data.OrchestrationMetadataJSON.IsUnknown() {
-		// User explicitly set it — update from API response
-		metaStr := string(asset.OrchestrationMetadata)
-		if len(asset.OrchestrationMetadata) > 0 && metaStr != "null" {
-			data.OrchestrationMetadataJSON = types.StringValue(metaStr)
+	// Convert OrchestrationMetadata — only update if user explicitly set it in config,
+	// except during import where we hydrate API values into state.
+	if !data.OrchestrationMetadata.IsNull() && !data.OrchestrationMetadata.IsUnknown() {
+		obj, d := assetOrchestrationMetadataObjectFromAPI(asset.OrchestrationMetadata)
+		diags.Append(d...)
+		if !d.HasError() {
+			data.OrchestrationMetadata = obj
 		}
 	} else {
-		// User didn't set it — keep null
-		data.OrchestrationMetadataJSON = types.StringNull()
+		data.OrchestrationMetadata = types.ObjectNull(assetOrchestrationMetadataAttrTypes())
 	}
 
 	// Convert worksite — from scoping_details.worksite.id
@@ -711,9 +915,11 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 	} else {
 		data.FirstSeen = types.StringValue("")
 	}
-	if asset.LastSeen != nil {
-		data.LastSeen = types.StringValue(fmt.Sprintf("%v", asset.LastSeen))
-	} else {
-		data.LastSeen = types.StringValue("")
+	if data.LastSeen.IsNull() || data.LastSeen.IsUnknown() || data.LastSeen.ValueString() == "" {
+		if asset.LastSeen != nil {
+			data.LastSeen = types.StringValue(fmt.Sprintf("%v", asset.LastSeen))
+		} else {
+			data.LastSeen = types.StringValue("")
+		}
 	}
 }

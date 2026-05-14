@@ -26,6 +26,8 @@ func TestAccUserGroupResource_basic(t *testing.T) {
 					resource.TestCheckResourceAttr("guardicore_user_group.test", "orchestrations_groups.#", "1"),
 					resource.TestCheckResourceAttrSet("guardicore_user_group.test", "orchestrations_groups.0.orchestration_id"),
 					resource.TestCheckResourceAttr("guardicore_user_group.test", "orchestrations_groups.0.groups.#", "1"),
+					resource.TestCheckResourceAttr("guardicore_user_group.test", "system_managed", "false"),
+					resource.TestCheckResourceAttr("guardicore_user_group.test", "managed_by", "terraform"),
 				),
 			},
 			// ImportState testing.

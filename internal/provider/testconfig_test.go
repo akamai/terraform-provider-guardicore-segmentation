@@ -6,13 +6,21 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
 	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+)
+
+const (
+	testAccDestroyCheckAttempts = 12
+	testAccDestroyCheckInterval = 2 * time.Second
 )
 
 // testConfigPath is the path to the test configuration file.
@@ -34,6 +42,9 @@ type TestConfig struct {
 	// User Group test dependencies
 	UserGroupOrchestrationID string `json:"user_group_orchestration_id"`
 	UserGroupGroupID         string `json:"user_group_group_id"`
+
+	// Worksite delete blocked acceptance-test fixture dependency
+	WorksiteAssignedAssetID string `json:"worksite_assigned_asset_id"`
 }
 
 // loadTestConfig loads the test configuration from file and environment variables.
@@ -100,8 +111,20 @@ func loadTestConfig() (*TestConfig, error) {
 	if v := os.Getenv("GUARDICORE_USER_GROUP_GROUP_ID"); v != "" {
 		config.UserGroupGroupID = v
 	}
+	if v := os.Getenv("GUARDICORE_WORKSITE_ASSIGNED_ASSET_ID"); v != "" {
+		config.WorksiteAssignedAssetID = v
+	}
 
 	return config, nil
+}
+
+func testAccWorksiteDeleteBlockedPreCheck(t *testing.T) {
+	t.Helper()
+	testAccWorksitePreCheck(t)
+
+	if testConfig.WorksiteAssignedAssetID == "" {
+		t.Skip("Skipping worksite delete blocked test: worksite_assigned_asset_id must be set in testconfig.json or GUARDICORE_WORKSITE_ASSIGNED_ASSET_ID")
+	}
 }
 
 // testAccProviderConfig returns the HCL provider block using loaded config values.
@@ -204,73 +227,95 @@ func testAccCheckResourceDestroyed(resourceType string) resource.TestCheckFunc {
 				continue
 			}
 
-			var exists bool
-			switch resourceType {
-			case "guardicore_label":
-				label, err := apiClient.GetLabel(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = label != nil
-
-			case "guardicore_label_group":
-				labelGroup, err := apiClient.GetLabelGroup(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = labelGroup != nil
-
-			case "guardicore_policy_rule":
-				rule, err := apiClient.GetPolicyRule(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = rule != nil
-
-			case "guardicore_dns_security":
-				blocklist, err := apiClient.GetDnsBlocklist(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = blocklist != nil
-
-			case "guardicore_incident":
-				// Incidents cannot be deleted via API, so destroy is a no-op.
-				// The resource is removed from state but persists in Akamai Guardicore Segmentation.
-				exists = false
-
-			case "guardicore_worksite":
-				worksite, err := apiClient.GetWorksite(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = worksite != nil
-
-			case "guardicore_user_group":
-				userGroup, err := apiClient.GetUserGroup(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				exists = userGroup != nil
-
-			case "guardicore_asset":
-				asset, err := apiClient.GetAsset(ctx, rs.Primary.ID)
-				if err != nil {
-					return err
-				}
-				// Asset DELETE deactivates rather than removes; check if still active
-				exists = asset != nil && asset.Status != "deleted"
-
-			default:
-				return fmt.Errorf("unknown resource type: %s", resourceType)
-			}
-
-			if exists {
-				return fmt.Errorf("%s %s still exists", resourceType, rs.Primary.ID)
+			if err := testAccWaitForResourceDestroyed(ctx, apiClient, resourceType, rs.Primary.ID); err != nil {
+				return err
 			}
 		}
 
 		return nil
+	}
+}
+
+func testAccWaitForResourceDestroyed(ctx context.Context, apiClient *client.Client, resourceType, id string) error {
+	for attempt := 1; attempt <= testAccDestroyCheckAttempts; attempt++ {
+		exists, err := testAccResourceExists(ctx, apiClient, resourceType, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return nil
+		}
+
+		if attempt == testAccDestroyCheckAttempts {
+			break
+		}
+
+		time.Sleep(testAccDestroyCheckInterval)
+	}
+
+	totalWait := testAccDestroyCheckInterval * time.Duration(testAccDestroyCheckAttempts-1)
+	return fmt.Errorf("%s %s still exists after %d checks over %s", resourceType, id, testAccDestroyCheckAttempts, totalWait)
+}
+
+func testAccResourceExists(ctx context.Context, apiClient *client.Client, resourceType, id string) (bool, error) {
+	switch resourceType {
+	case "guardicore_label":
+		label, err := apiClient.GetLabel(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return label != nil, nil
+
+	case "guardicore_label_group":
+		labelGroup, err := apiClient.GetLabelGroup(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return labelGroup != nil, nil
+
+	case "guardicore_policy_rule":
+		rule, err := apiClient.GetPolicyRule(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return rule != nil, nil
+
+	case "guardicore_dns_security":
+		blocklist, err := apiClient.GetDnsBlocklist(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return blocklist != nil, nil
+
+	case "guardicore_incident":
+		// Incidents cannot be deleted via API, so destroy is a no-op.
+		// The resource is removed from state but persists in Akamai Guardicore Segmentation.
+		return false, nil
+
+	case "guardicore_worksite":
+		worksite, err := apiClient.GetWorksite(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return worksite != nil, nil
+
+	case "guardicore_user_group":
+		userGroup, err := apiClient.GetUserGroup(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		return userGroup != nil, nil
+
+	case "guardicore_asset":
+		asset, err := apiClient.GetAsset(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		// Asset DELETE deactivates rather than removes; check if still active
+		return asset != nil && asset.Status != "deleted", nil
+
+	default:
+		return false, fmt.Errorf("unknown resource type: %s", resourceType)
 	}
 }
 
@@ -637,6 +682,31 @@ func testAccWorksitePreCheck(t *testing.T) {
 	}
 }
 
+// testAccDnsSecurityPreCheck verifies the DNS Security feature is enabled on the Akamai Guardicore Segmentation instance.
+func testAccDnsSecurityPreCheck(t *testing.T) {
+	t.Helper()
+	testAccPreCheck(t)
+
+	config := client.Config{
+		BaseURL:            testConfig.BaseURL,
+		Username:           testConfig.Username,
+		Password:           testConfig.Password,
+		AccessToken:        testConfig.AccessToken,
+		RefreshToken:       testConfig.RefreshToken,
+		InsecureSkipVerify: testConfig.InsecureSkipVerify,
+	}
+
+	apiClient, err := client.NewClient(config)
+	if err != nil {
+		t.Skipf("Skipping DNS security test: failed to create client: %v", err)
+	}
+
+	_, err = apiClient.ListDnsBlocklists(context.Background(), "", "")
+	if err != nil {
+		t.Skipf("Skipping DNS security test: %v", err)
+	}
+}
+
 // testAccPolicyGroupPreCheck verifies the policy groups feature is enabled on the Akamai Guardicore Segmentation instance.
 func testAccPolicyGroupPreCheck(t *testing.T) {
 	t.Helper()
@@ -692,6 +762,67 @@ func testAccDeleteWorksiteOutOfBand(resourceName string) resource.TestCheckFunc 
 	}
 }
 
+func testAccAssignAssetToWorksiteOutOfBand(worksiteResourceName, assetID string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		ws, ok := s.RootModule().Resources[worksiteResourceName]
+		if !ok {
+			return fmt.Errorf("resource not found: %s", worksiteResourceName)
+		}
+
+		if testConfig == nil {
+			return fmt.Errorf("test config not loaded")
+		}
+
+		config := client.Config{
+			BaseURL:            testConfig.BaseURL,
+			Username:           testConfig.Username,
+			Password:           testConfig.Password,
+			AccessToken:        testConfig.AccessToken,
+			RefreshToken:       testConfig.RefreshToken,
+			InsecureSkipVerify: testConfig.InsecureSkipVerify,
+		}
+
+		apiClient, err := client.NewClient(config)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+
+		return apiClient.AssignWorksite(context.Background(), &client.WorksiteAssignRequest{
+			ID:         ws.Primary.ID,
+			EntityType: "asset",
+			EntityIDs:  []string{assetID},
+		})
+	}
+}
+
+func testAccAssignAssetToAllWorksitesOutOfBand(assetID string) resource.TestCheckFunc {
+	return func(_ *terraform.State) error {
+		if testConfig == nil {
+			return fmt.Errorf("test config not loaded")
+		}
+
+		config := client.Config{
+			BaseURL:            testConfig.BaseURL,
+			Username:           testConfig.Username,
+			Password:           testConfig.Password,
+			AccessToken:        testConfig.AccessToken,
+			RefreshToken:       testConfig.RefreshToken,
+			InsecureSkipVerify: testConfig.InsecureSkipVerify,
+		}
+
+		apiClient, err := client.NewClient(config)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+
+		return apiClient.AssignWorksite(context.Background(), &client.WorksiteAssignRequest{
+			ID:         "all_worksites",
+			EntityType: "asset",
+			EntityIDs:  []string{assetID},
+		})
+	}
+}
+
 // testAccUserGroupPreCheck verifies orchestration/group IDs are configured for user group tests.
 func testAccUserGroupPreCheck(t *testing.T) {
 	t.Helper()
@@ -728,7 +859,13 @@ func testAccDeleteUserGroupOutOfBand(resourceName string) resource.TestCheckFunc
 			return fmt.Errorf("failed to create client: %w", err)
 		}
 
-		return apiClient.DeleteUserGroup(context.Background(), rs.Primary.ID)
+		if err := apiClient.DeleteUserGroup(context.Background(), rs.Primary.ID); err != nil {
+			return err
+		}
+
+		return apiClient.CreateUserGroupRevision(context.Background(), &client.UserGroupRevisionRequest{
+			Comments: "Published via Terraform test cleanup",
+		})
 	}
 }
 
@@ -755,6 +892,41 @@ func testAccAssetPreCheck(t *testing.T) {
 	if err != nil {
 		t.Skipf("Skipping asset test: %v", err)
 	}
+}
+
+// testAccReadOnlyLabel returns a read-only label for tests that validate
+// read-only label behavior. Skips the test if no read-only label exists.
+func testAccReadOnlyLabel(t *testing.T) *client.Label {
+	t.Helper()
+	testAccPreCheck(t)
+
+	config := client.Config{
+		BaseURL:            testConfig.BaseURL,
+		Username:           testConfig.Username,
+		Password:           testConfig.Password,
+		AccessToken:        testConfig.AccessToken,
+		RefreshToken:       testConfig.RefreshToken,
+		InsecureSkipVerify: testConfig.InsecureSkipVerify,
+	}
+
+	apiClient, err := client.NewClient(config)
+	if err != nil {
+		t.Skipf("Skipping read-only label test: failed to create client: %v", err)
+	}
+
+	labels, err := apiClient.ListLabels(context.Background(), "", "")
+	if err != nil {
+		t.Skipf("Skipping read-only label test: %v", err)
+	}
+
+	for _, label := range labels {
+		if label.ReadOnly != nil && *label.ReadOnly {
+			return &label
+		}
+	}
+
+	t.Skip("Skipping read-only label test: no read-only label found")
+	return nil
 }
 
 // testAccDeleteAssetOutOfBand deletes (deactivates) an asset via API for disappears tests.
@@ -784,6 +956,106 @@ func testAccDeleteAssetOutOfBand(resourceName string) resource.TestCheckFunc {
 		}
 
 		return apiClient.BulkDeactivateAssets(context.Background(), []string{rs.Primary.ID})
+	}
+}
+
+// testAccUpdateLabelValueOutOfBand updates a label value via API for drift tests.
+func testAccUpdateLabelValueOutOfBand(resourceName, newValue string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("resource not found: %s", resourceName)
+		}
+
+		if testConfig == nil {
+			return fmt.Errorf("test config not loaded")
+		}
+
+		config := client.Config{
+			BaseURL:            testConfig.BaseURL,
+			Username:           testConfig.Username,
+			Password:           testConfig.Password,
+			AccessToken:        testConfig.AccessToken,
+			RefreshToken:       testConfig.RefreshToken,
+			InsecureSkipVerify: testConfig.InsecureSkipVerify,
+		}
+
+		apiClient, err := client.NewClient(config)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+
+		current, err := apiClient.GetLabel(context.Background(), rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("label not found: %s", rs.Primary.ID)
+		}
+
+		if _, err := apiClient.UpdateLabel(context.Background(), rs.Primary.ID, &client.LabelUpdate{Key: current.Key, Value: newValue}); err != nil {
+			return err
+		}
+
+		return apiClient.PublishLabelGroups(context.Background())
+	}
+}
+
+// testAccUpdateAssetCommentsOutOfBand updates an asset comment via API for drift tests.
+func testAccUpdateAssetCommentsOutOfBand(resourceName, newComments string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("resource not found: %s", resourceName)
+		}
+
+		if testConfig == nil {
+			return fmt.Errorf("test config not loaded")
+		}
+
+		config := client.Config{
+			BaseURL:            testConfig.BaseURL,
+			Username:           testConfig.Username,
+			Password:           testConfig.Password,
+			AccessToken:        testConfig.AccessToken,
+			RefreshToken:       testConfig.RefreshToken,
+			InsecureSkipVerify: testConfig.InsecureSkipVerify,
+		}
+
+		apiClient, err := client.NewClient(config)
+		if err != nil {
+			return fmt.Errorf("failed to create client: %w", err)
+		}
+
+		current, err := apiClient.GetAsset(context.Background(), rs.Primary.ID)
+		if err != nil {
+			return err
+		}
+		if current == nil {
+			return fmt.Errorf("asset not found: %s", rs.Primary.ID)
+		}
+
+		item := client.AssetBulkUpdateItem{
+			AssetID:  rs.Primary.ID,
+			Name:     current.Name,
+			Nics:     current.Nics,
+			Status:   current.Status,
+			Comments: newComments,
+		}
+		item.Labels = &current.Labels
+
+		bulkResp, err := apiClient.BulkUpdateAssets(context.Background(), []client.AssetBulkUpdateItem{item})
+		if err != nil {
+			return err
+		}
+		if bulkResp.NumberOfFailed > 0 {
+			errMsg := "unknown error"
+			if len(bulkResp.Errors) > 0 {
+				errMsg = bulkResp.Errors[0].Error
+			}
+			return fmt.Errorf("bulk update asset failed: %s", errMsg)
+		}
+		return nil
 	}
 }
 
@@ -818,5 +1090,236 @@ func testAccCheckJSONAttr(resourceName, attrName string, expectedJSON string) re
 		}
 
 		return nil
+	}
+}
+
+func testAccCaptureResourceID(resourceName string, dest *string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[resourceName]
+		if !ok {
+			return fmt.Errorf("resource not found: %s", resourceName)
+		}
+		if rs.Primary == nil {
+			return fmt.Errorf("resource has no primary state: %s", resourceName)
+		}
+		if rs.Primary.ID == "" {
+			return fmt.Errorf("resource has empty id: %s", resourceName)
+		}
+		*dest = rs.Primary.ID
+		return nil
+	}
+}
+
+func testAccCheckResourceIDEquals(expected *string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources["guardicore_label.test"]
+		if !ok {
+			return fmt.Errorf("resource not found: guardicore_label.test")
+		}
+		if rs.Primary == nil {
+			return fmt.Errorf("resource has no primary state: guardicore_label.test")
+		}
+		if *expected == "" {
+			return fmt.Errorf("expected id not captured for guardicore_label.test")
+		}
+		if rs.Primary.ID != *expected {
+			return fmt.Errorf("resource id changed unexpectedly for guardicore_label.test: got %q want %q", rs.Primary.ID, *expected)
+		}
+		return nil
+	}
+}
+
+func TestLoadTestConfig_FromFile(t *testing.T) {
+	oldPath := *testConfigPath
+	t.Cleanup(func() { *testConfigPath = oldPath })
+
+	for _, key := range []string{
+		"GUARDICORE_BASE_URL",
+		"GUARDICORE_USERNAME",
+		"GUARDICORE_PASSWORD",
+		"GUARDICORE_ACCESS_TOKEN",
+		"GUARDICORE_REFRESH_TOKEN",
+		"GUARDICORE_INSECURE_SKIP_VERIFY",
+		"GUARDICORE_REQUEST_TIMEOUT",
+		"GUARDICORE_USER_GROUP_ORCHESTRATION_ID",
+		"GUARDICORE_USER_GROUP_GROUP_ID",
+	} {
+		_ = os.Unsetenv(key)
+	}
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "testconfig.json")
+	configJSON := `{
+		"base_url": "https://example.local",
+		"username": "file-user",
+		"password": "file-pass",
+		"access_token": "file-at",
+		"refresh_token": "file-rt",
+		"insecure_skip_verify": true,
+		"request_timeout": 77,
+		"user_group_orchestration_id": "orch-file",
+		"user_group_group_id": "group-file"
+	}`
+
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	*testConfigPath = configPath
+
+	got, err := loadTestConfig()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if got.BaseURL != "https://example.local" || got.Username != "file-user" || got.Password != "file-pass" {
+		t.Fatalf("unexpected base credentials in loaded config: %#v", got)
+	}
+	if got.AccessToken != "file-at" || got.RefreshToken != "file-rt" {
+		t.Fatalf("unexpected token values in loaded config: %#v", got)
+	}
+	if !got.InsecureSkipVerify || got.RequestTimeout != 77 {
+		t.Fatalf("unexpected tls/timeout values in loaded config: %#v", got)
+	}
+	if got.UserGroupOrchestrationID != "orch-file" || got.UserGroupGroupID != "group-file" {
+		t.Fatalf("unexpected user group dependency values in loaded config: %#v", got)
+	}
+}
+
+func TestLoadTestConfig_EnvOverridesFile(t *testing.T) {
+	oldPath := *testConfigPath
+	t.Cleanup(func() { *testConfigPath = oldPath })
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "testconfig.json")
+	if err := os.WriteFile(configPath, []byte(`{"base_url":"https://from-file"}`), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	*testConfigPath = configPath
+
+	t.Setenv("GUARDICORE_BASE_URL", "https://from-env")
+	t.Setenv("GUARDICORE_USERNAME", "env-user")
+	t.Setenv("GUARDICORE_PASSWORD", "env-pass")
+	t.Setenv("GUARDICORE_ACCESS_TOKEN", "env-at")
+	t.Setenv("GUARDICORE_REFRESH_TOKEN", "env-rt")
+	t.Setenv("GUARDICORE_INSECURE_SKIP_VERIFY", "true")
+	t.Setenv("GUARDICORE_REQUEST_TIMEOUT", "123")
+	t.Setenv("GUARDICORE_USER_GROUP_ORCHESTRATION_ID", "orch-env")
+	t.Setenv("GUARDICORE_USER_GROUP_GROUP_ID", "group-env")
+
+	got, err := loadTestConfig()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if got.BaseURL != "https://from-env" || got.Username != "env-user" || got.Password != "env-pass" {
+		t.Fatalf("expected env credentials to override, got %#v", got)
+	}
+	if got.AccessToken != "env-at" || got.RefreshToken != "env-rt" {
+		t.Fatalf("expected env tokens to override, got %#v", got)
+	}
+	if !got.InsecureSkipVerify || got.RequestTimeout != 123 {
+		t.Fatalf("expected env tls/timeout to override, got %#v", got)
+	}
+	if got.UserGroupOrchestrationID != "orch-env" || got.UserGroupGroupID != "group-env" {
+		t.Fatalf("expected env user group values to override, got %#v", got)
+	}
+}
+
+func TestLoadTestConfig_InvalidJSON(t *testing.T) {
+	oldPath := *testConfigPath
+	t.Cleanup(func() { *testConfigPath = oldPath })
+
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "testconfig.json")
+	if err := os.WriteFile(configPath, []byte(`{"base_url":`), 0o600); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+	*testConfigPath = configPath
+
+	_, err := loadTestConfig()
+	if err == nil {
+		t.Fatal("expected parse error for invalid JSON")
+	}
+}
+
+func TestTestAccProviderConfigBuilders(t *testing.T) {
+	old := testConfig
+	t.Cleanup(func() { testConfig = old })
+
+	testConfig = nil
+	if got := testAccProviderConfig(); got != "" {
+		t.Fatalf("expected empty config when testConfig is nil, got %q", got)
+	}
+
+	testConfig = &TestConfig{
+		BaseURL:            "https://example.local",
+		Username:           "alice",
+		Password:           "secret",
+		InsecureSkipVerify: true,
+		RequestTimeout:     15,
+	}
+
+	got := testAccProviderConfig()
+	if !strings.Contains(got, `base_url = "https://example.local"`) || !strings.Contains(got, `username = "alice"`) {
+		t.Fatalf("expected username/password config, got %s", got)
+	}
+	if !strings.Contains(got, "insecure_skip_verify = true") || !strings.Contains(got, "request_timeout = 15") {
+		t.Fatalf("expected optional attrs in config, got %s", got)
+	}
+
+	testConfig.AccessToken = "token-only"
+	got = testAccProviderConfig()
+	if !strings.Contains(got, `access_token = "token-only"`) {
+		t.Fatalf("expected access token config, got %s", got)
+	}
+	if strings.Contains(got, `username =`) || strings.Contains(got, `password =`) {
+		t.Fatalf("expected token config to omit username/password, got %s", got)
+	}
+
+	got = testAccProviderConfigWithRefValidation(true)
+	if !strings.Contains(got, "validate_references_on_destroy = true") {
+		t.Fatalf("expected ref validation flag, got %s", got)
+	}
+}
+
+func TestTestAccCheckJSONAttr(t *testing.T) {
+	state := &terraform.State{
+		Modules: []*terraform.ModuleState{{
+			Path:      []string{"root"},
+			Outputs:   map[string]*terraform.OutputState{},
+			Resources: map[string]*terraform.ResourceState{},
+		}},
+	}
+	state.RootModule().Resources["data.guardicore_policy_rule.test"] = &terraform.ResourceState{
+		Type: "guardicore_policy_rule",
+		Primary: &terraform.InstanceState{
+			ID: "rule-1",
+			Attributes: map[string]string{
+				"spec_json": `{"ports":[80,443],"protocols":["TCP"]}`,
+			},
+		},
+	}
+
+	check := testAccCheckJSONAttr("data.guardicore_policy_rule.test", "spec_json", `{
+		"protocols": ["TCP"],
+		"ports": [80, 443]
+	}`)
+	if err := check(state); err != nil {
+		t.Fatalf("expected semantic JSON equality, got %v", err)
+	}
+
+	mismatch := testAccCheckJSONAttr("data.guardicore_policy_rule.test", "spec_json", `{"ports":[22]}`)
+	if err := mismatch(state); err == nil {
+		t.Fatal("expected mismatch error")
+	}
+
+	missingAttr := testAccCheckJSONAttr("data.guardicore_policy_rule.test", "missing", `{}`)
+	if err := missingAttr(state); err == nil || !strings.Contains(err.Error(), "attribute missing not found") {
+		t.Fatalf("expected missing attribute error, got %v", err)
+	}
+
+	missingResource := testAccCheckJSONAttr("data.guardicore_policy_rule.nope", "spec_json", `{}`)
+	if err := missingResource(state); err == nil || !strings.Contains(err.Error(), "resource not found") {
+		t.Fatalf("expected missing resource error, got %v", err)
 	}
 }

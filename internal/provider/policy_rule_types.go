@@ -594,6 +594,21 @@ func policyRuleEndpointObjectToMap(ctx context.Context, object types.Object, fie
 		}
 	}
 
+	if _, hasAC := result["address_classification"]; hasAC {
+		otherFields := []string{"subnets", "processes", "windows_services", "domains",
+			"label_group_ids", "user_group_ids", "asset_ids", "policy_groups", "labels"}
+		for _, f := range otherFields {
+			if _, ok := result[f]; ok {
+				diags.AddError(
+					"Invalid Endpoint Configuration",
+					fmt.Sprintf("%s.address_classification cannot be combined with %s.%s; "+
+						"when address_classification is set, no other endpoint filter fields are allowed",
+						fieldName, fieldName, f),
+				)
+			}
+		}
+	}
+
 	if len(result) == 0 {
 		return nil, diags
 	}
@@ -711,6 +726,7 @@ func buildPolicyRuleSpecFromModel(ctx context.Context, data *PolicyRuleResourceM
 	}
 
 	spec = normalizePolicyRuleLegacyAliases(spec)
+	delete(spec, "creation_origin")
 
 	if !data.Action.IsNull() && !data.Action.IsUnknown() && data.Action.ValueString() != "" {
 		spec["action"] = data.Action.ValueString()
@@ -777,10 +793,12 @@ func buildPolicyRuleSpecFromModel(ctx context.Context, data *PolicyRuleResourceM
 			if !match.ICMPType.IsNull() && !match.ICMPType.IsUnknown() {
 				matchMap["icmp_type"] = match.ICMPType.ValueInt64()
 			}
-			if codes, d := intSliceFromList(ctx, match.ICMPCodes, fmt.Sprintf("icmp_matches[%d].icmp_codes", i)); len(codes) > 0 || d.HasError() {
-				diags.Append(d...)
-				matchMap["icmp_codes"] = codes
+			codes, d := intSliceFromList(ctx, match.ICMPCodes, fmt.Sprintf("icmp_matches[%d].icmp_codes", i))
+			diags.Append(d...)
+			if codes == nil {
+				codes = []int64{}
 			}
+			matchMap["icmp_codes"] = codes
 			if !match.Version.IsNull() && !match.Version.IsUnknown() && match.Version.ValueString() != "" {
 				matchMap["version"] = match.Version.ValueString()
 			}
@@ -829,6 +847,8 @@ func buildPolicyRuleSpecFromModel(ctx context.Context, data *PolicyRuleResourceM
 	if _, ok := spec["destination"]; !ok {
 		spec["destination"] = map[string]any{}
 	}
+
+	delete(spec, "creation_origin")
 
 	if len(spec) == 0 {
 		diags.AddError("Missing Policy Rule Configuration", "Set typed policy rule attributes or provide raw_spec_json.")
@@ -983,7 +1003,9 @@ func policyRuleICMPMatchListFromAny(ctx context.Context, value any) (types.List,
 			icmpType = types.Int64Value(value)
 		}
 
-		icmpCodes := types.ListNull(types.Int64Type)
+		emptyCodes, d := types.ListValueFrom(ctx, types.Int64Type, []int64{})
+		diags.Append(d...)
+		icmpCodes := emptyCodes
 		if value, d := listIntsFromAny(ctx, matchMap["icmp_codes"]); !value.IsNull() || d.HasError() {
 			diags.Append(d...)
 			icmpCodes = value

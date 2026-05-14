@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 )
 
@@ -126,6 +127,7 @@ func (v *policyRuleRefValidator) ValidateResource(ctx context.Context, req resou
 	if !data.WorksiteID.IsNull() && !data.WorksiteID.IsUnknown() {
 		resp.Diagnostics.Append(validateWorksiteExists(ctx, v.client, data.WorksiteID.ValueString())...)
 	}
+
 }
 
 // policyGroupRefValidator validates that label IDs in LABEL type policy group members exist.
@@ -169,7 +171,7 @@ type assetRefValidator struct {
 }
 
 func (v *assetRefValidator) Description(_ context.Context) string {
-	return "Validates that label IDs referenced in the labels block exist in Akamai Guardicore Segmentation."
+	return "Validates that label IDs referenced in the labels block exist and are directly assignable in Akamai Guardicore Segmentation."
 }
 
 func (v *assetRefValidator) MarkdownDescription(ctx context.Context) string {
@@ -186,6 +188,8 @@ func (v *assetRefValidator) ValidateResource(ctx context.Context, req resource.V
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	validateAssetOrchestrationMetadataConfig(data.OrchestrationMetadata, path.Root("orchestration_metadata"), &resp.Diagnostics)
 
 	if len(data.Labels) > 0 {
 		resp.Diagnostics.Append(validateAssetLabelRefs(ctx, v.client, data.Labels)...)

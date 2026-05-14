@@ -29,7 +29,8 @@ func NewIncidentResource() resource.Resource {
 
 // IncidentResource defines the resource implementation.
 type IncidentResource struct {
-	client *client.Client
+	client        *client.Client
+	createBatcher *Batcher[*client.IncidentCreate, string]
 }
 
 // IncidentResourceModel describes the resource data model.
@@ -217,6 +218,7 @@ func (r *IncidentResource) Configure(ctx context.Context, req resource.Configure
 	}
 
 	r.client = providerData.Client
+	r.createBatcher = providerData.IncidentCreateBatcher
 }
 
 func (r *IncidentResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
@@ -233,7 +235,7 @@ func (r *IncidentResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
-	id, err := r.client.CreateIncident(ctx, incident)
+	id, err := r.createBatcher.Enqueue(ctx, incident)
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create incident, got error: %s", err))
 		return

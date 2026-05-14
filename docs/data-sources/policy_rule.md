@@ -123,7 +123,9 @@ Read-Only:
 
 Read-Only:
 
-- `names` (List of String)
+- `allowed_image_names` (List of String)
+- `display_name` (String)
+- `service_name` (String)
 
 
 
@@ -202,4 +204,6 @@ Read-Only:
 
 Read-Only:
 
-- `names` (List of String)
+- `allowed_image_names` (List of String)
+- `display_name` (String)
+- `service_name` (String)

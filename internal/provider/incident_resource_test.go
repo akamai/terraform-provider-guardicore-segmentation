@@ -168,3 +168,44 @@ resource "guardicore_incident" "test" {
 }
 `, severity)
 }
+
+func TestAccIncidentResource_multipleResources(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             testAccCheckResourceDestroyed("guardicore_incident"),
+		Steps: []resource.TestStep{{
+			Config: testAccIncidentResourceConfigMultiple(),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttrSet("guardicore_incident.test1", "id"),
+				resource.TestCheckResourceAttrSet("guardicore_incident.test2", "id"),
+			),
+		}},
+	})
+}
+
+func testAccIncidentResourceConfigMultiple() string {
+	return testAccProviderConfig() + `
+resource "guardicore_incident" "test1" {
+  type        = "CustomIncident"
+  severity    = "LOW"
+  time        = 1621957270000
+  description = "Terraform acceptance test incident 1"
+  summary     = "### Test Incident 1"
+  tags        = ["tf-acc-test-1"]
+
+  affected_assets_json = jsonencode([{ type = "IP", value = "10.0.0.1" }])
+}
+
+resource "guardicore_incident" "test2" {
+  type        = "CustomIncident"
+  severity    = "LOW"
+  time        = 1621957271000
+  description = "Terraform acceptance test incident 2"
+  summary     = "### Test Incident 2"
+  tags        = ["tf-acc-test-2"]
+
+  affected_assets_json = jsonencode([{ type = "IP", value = "10.0.0.2" }])
+}
+`
+}
