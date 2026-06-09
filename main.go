@@ -25,7 +25,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/akamai/guardicore",
+		Address: "registry.terraform.io/akamai/guardicore-segmentation",
 		Debug:   debug,
 	}
 

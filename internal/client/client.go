@@ -3,12 +3,13 @@ package client
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
@@ -92,7 +93,7 @@ type BulkValidationError struct {
 
 func (e *BulkValidationError) Error() string {
 	if len(e.ItemErrors) == 0 {
-		return fmt.Sprintf("bulk validation error (status %d): %s", e.StatusCode, e.RawBody)
+		return fmt.Sprintf("bulk validation error (status %d): see TF_LOG=DEBUG for full body", e.StatusCode)
 	}
 	indices := e.failedIndices()
 	parts := make([]string, 0, len(indices))
@@ -395,7 +396,7 @@ func (c *Client) refreshAuthentication(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		apiErr := parseAPIError(resp.StatusCode, body)
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return fmt.Errorf("refresh token authentication failed (refresh token may be expired or invalid; use \"access_token\" or username/password to recover): %w", apiErr)
@@ -444,7 +445,7 @@ func (c *Client) passwordAuthentication(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		apiErr := parseAPIError(resp.StatusCode, body)
 		if looksLikeMFAError(resp.StatusCode, body) {
 			return fmt.Errorf("password authentication failed (possible MFA issue — "+
@@ -472,6 +473,19 @@ func (c *Client) passwordAuthentication(ctx context.Context) error {
 
 	c.token = authResp.AccessToken
 	return nil
+}
+
+// pathf builds an API path with url.PathEscape applied to every variadic
+// segment. Use this for any path that embeds a server-issued or
+// user-influenced ID, so caller-supplied values cannot break out of their
+// path segment via "/", "?", "#", or "%". For query-string values, use
+// url.QueryEscape directly — pathf is path-only.
+func (c *Client) pathf(format string, parts ...string) string {
+	escaped := make([]any, len(parts))
+	for i, p := range parts {
+		escaped[i] = url.PathEscape(p)
+	}
+	return fmt.Sprintf(format, escaped...)
 }
 
 // doRequest performs an HTTP request with authentication and retry on 401.
@@ -585,8 +599,23 @@ func (c *Client) retryDelay(resp *http.Response, remainingRetries int) time.Dura
 	if delay > settings.RequestRetryMaxDelay {
 		delay = settings.RequestRetryMaxDelay
 	}
+	if settings.RetryJitter {
+		jitterFactor := 0.75 + rand.Float64()*0.5
+		delay = time.Duration(float64(delay) * jitterFactor)
+	}
 
 	return delay
+}
+
+func readErrorBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return []byte("<empty response body>")
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []byte("<failed to read response body: " + err.Error() + ">")
+	}
+	return body
 }
 
 func parseRetryAfter(value string) (time.Duration, bool) {
@@ -642,7 +671,7 @@ func (c *Client) BulkCreateLabels(ctx context.Context, labels []LabelCreate) (*L
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if resp.StatusCode == http.StatusBadRequest {
 			if bulkErr := parseBulkLabelValidationError(resp.StatusCode, body); bulkErr != nil {
 				return nil, fmt.Errorf("failed to create labels: %w", bulkErr)
@@ -674,7 +703,7 @@ func (c *Client) BulkUpdateLabels(ctx context.Context, labels []LabelUpdate) (*L
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return nil, fmt.Errorf("failed to update labels: %w", parseAPIError(resp.StatusCode, body))
 	}
 
@@ -704,8 +733,8 @@ func (c *Client) BulkDeleteLabels(ctx context.Context, ids []string) (*LabelBulk
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to delete labels: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to delete labels: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	if resp.StatusCode == http.StatusNoContent {
@@ -737,7 +766,7 @@ func (c *Client) CreateLabel(ctx context.Context, label *LabelCreate) (*LabelCre
 
 // GetLabel retrieves a label by ID.
 func (c *Client) GetLabel(ctx context.Context, id string) (*Label, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/v4.0/labels/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, c.pathf("/api/v4.0/labels/%s", id), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -748,8 +777,8 @@ func (c *Client) GetLabel(ctx context.Context, id string) (*Label, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get label: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to get label: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var getResp LabelGetResponse
@@ -793,14 +822,14 @@ func (c *Client) UpdateLabel(ctx context.Context, id string, label *LabelUpdate)
 	}
 
 	updateReq := &LabelUpdate{Key: label.Key, Value: label.Value}
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v4.0/labels/%s", id), updateReq)
+	resp, err := c.doRequest(ctx, http.MethodPut, c.pathf("/api/v4.0/labels/%s", id), updateReq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		return nil, fmt.Errorf("failed to update label: %w", parseAPIError(resp.StatusCode, body))
 	}
 
@@ -829,7 +858,7 @@ func (c *Client) UpdateLabelDynamicCriteriaChanges(ctx context.Context, labelID 
 		return err
 	}
 
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/v3.0/visibility/labels/%s/dynamic-criteria/changes", url.PathEscape(labelID)), req)
+	resp, err := c.doRequest(ctx, http.MethodPost, c.pathf("/api/v3.0/visibility/labels/%s/dynamic-criteria/changes", labelID), req)
 	if err != nil {
 		return err
 	}
@@ -839,7 +868,7 @@ func (c *Client) UpdateLabelDynamicCriteriaChanges(ctx context.Context, labelID 
 		return nil
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body := readErrorBody(resp)
 	return parseAPIError(resp.StatusCode, body)
 }
 
@@ -1087,7 +1116,7 @@ func labelCriteriaModificationScore(current LabelCriteria, desired LabelCriteria
 
 func newUUIDv4String() (string, error) {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	if _, err := crand.Read(b); err != nil {
 		return "", err
 	}
 
@@ -1131,7 +1160,7 @@ func (c *Client) DeleteLabel(ctx context.Context, id string) error {
 // This is used as a fallback when the bulk endpoint fails to delete labels
 // with dynamic criteria.
 func (c *Client) DeleteLabelByID(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v4.0/labels/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/labels/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -1141,7 +1170,7 @@ func (c *Client) DeleteLabelByID(ctx context.Context, id string) error {
 		return nil
 	}
 
-	body, _ := io.ReadAll(resp.Body)
+	body := readErrorBody(resp)
 	return fmt.Errorf("failed to delete label: %w", parseAPIError(resp.StatusCode, body))
 }
 
@@ -1157,9 +1186,10 @@ func (c *Client) ListLabels(ctx context.Context, key, value string) ([]Label, er
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing labels; "+
+					"filters: key=%q value=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allLabels),
+				page, len(allLabels), key, value,
 			)
 		}
 		page++
@@ -1182,9 +1212,9 @@ func (c *Client) ListLabels(ctx context.Context, key, value string) ([]Label, er
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list labels: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list labels: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListLabelsResponse
@@ -1217,8 +1247,8 @@ func (c *Client) CreateLabelGroup(ctx context.Context, labelGroup *LabelGroupCre
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to create label group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to create label group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -1232,7 +1262,7 @@ func (c *Client) CreateLabelGroup(ctx context.Context, labelGroup *LabelGroupCre
 
 // GetLabelGroup retrieves a label group by ID.
 func (c *Client) GetLabelGroup(ctx context.Context, id string) (*LabelGroup, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/v4.0/label-groups/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, c.pathf("/api/v4.0/label-groups/%s", id), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1243,8 +1273,8 @@ func (c *Client) GetLabelGroup(ctx context.Context, id string) (*LabelGroup, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get label group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to get label group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -1267,15 +1297,15 @@ func (c *Client) GetLabelGroup(ctx context.Context, id string) (*LabelGroup, err
 
 // UpdateLabelGroup updates an existing label group.
 func (c *Client) UpdateLabelGroup(ctx context.Context, id string, labelGroup *LabelGroupCreate) (*LabelGroupCreate, error) {
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v4.0/label-groups/%s", id), labelGroup)
+	resp, err := c.doRequest(ctx, http.MethodPut, c.pathf("/api/v4.0/label-groups/%s", id), labelGroup)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to update label group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to update label group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	labelGroup.ID = id
@@ -1284,7 +1314,7 @@ func (c *Client) UpdateLabelGroup(ctx context.Context, id string, labelGroup *La
 
 // DeleteLabelGroup deletes a label group.
 func (c *Client) DeleteLabelGroup(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v4.0/label-groups/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/label-groups/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -1296,8 +1326,8 @@ func (c *Client) DeleteLabelGroup(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete label group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to delete label group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1315,9 +1345,10 @@ func (c *Client) ListLabelGroups(ctx context.Context, key, value string) ([]Labe
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing label groups; "+
+					"filters: key=%q value=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allGroups),
+				page, len(allGroups), key, value,
 			)
 		}
 		page++
@@ -1340,9 +1371,9 @@ func (c *Client) ListLabelGroups(ctx context.Context, key, value string) ([]Labe
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list label groups: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list label groups: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListLabelGroupsResponse
@@ -1373,8 +1404,8 @@ func (c *Client) PublishLabelGroups(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to publish label groups: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to publish label groups: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1403,11 +1434,11 @@ func (c *Client) CreatePolicyGroup(ctx context.Context, group *PolicyGroupCreate
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 			return "", ErrPolicyGroupsFeatureDisabled
 		}
-		return "", fmt.Errorf("failed to create policy group: status %d, body: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("failed to create policy group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -1432,11 +1463,11 @@ func (c *Client) GetPolicyGroup(ctx context.Context, id string) (*PolicyGroup, e
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 			return nil, ErrPolicyGroupsFeatureDisabled
 		}
-		return nil, fmt.Errorf("failed to get policy group: status %d, body: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("failed to get policy group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var listResp ListPolicyGroupsResponse
@@ -1453,18 +1484,18 @@ func (c *Client) GetPolicyGroup(ctx context.Context, id string) (*PolicyGroup, e
 
 // UpdatePolicyGroup updates an existing policy group.
 func (c *Client) UpdatePolicyGroup(ctx context.Context, id string, group *PolicyGroupCreate) error {
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v4.0/policy-groups/%s", url.PathEscape(id)), group)
+	resp, err := c.doRequest(ctx, http.MethodPut, c.pathf("/api/v4.0/policy-groups/%s", id), group)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 			return ErrPolicyGroupsFeatureDisabled
 		}
-		return fmt.Errorf("failed to update policy group: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to update policy group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1472,7 +1503,7 @@ func (c *Client) UpdatePolicyGroup(ctx context.Context, id string, group *Policy
 
 // DeletePolicyGroup deletes a policy group.
 func (c *Client) DeletePolicyGroup(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v4.0/policy-groups/%s", url.PathEscape(id)), nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/policy-groups/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -1483,11 +1514,11 @@ func (c *Client) DeletePolicyGroup(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 			return ErrPolicyGroupsFeatureDisabled
 		}
-		return fmt.Errorf("failed to delete policy group: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to delete policy group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1505,9 +1536,10 @@ func (c *Client) ListPolicyGroups(ctx context.Context, name, typ string) ([]Poli
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing policy groups; "+
+					"filters: name=%q type=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allGroups),
+				page, len(allGroups), name, typ,
 			)
 		}
 		page++
@@ -1530,12 +1562,12 @@ func (c *Client) ListPolicyGroups(ctx context.Context, name, typ string) ([]Poli
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
 			if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 				return nil, ErrPolicyGroupsFeatureDisabled
 			}
-			return nil, fmt.Errorf("failed to list policy groups: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list policy groups: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListPolicyGroupsResponse
@@ -1566,11 +1598,11 @@ func (c *Client) PublishPolicyGroups(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyGroupFeatureDisabled(resp.StatusCode, body) {
 			return ErrPolicyGroupsFeatureDisabled
 		}
-		return fmt.Errorf("failed to publish policy groups: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to publish policy groups: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1587,8 +1619,8 @@ func (c *Client) CreatePolicyRule(ctx context.Context, spec map[string]interface
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create policy rule: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return "", fmt.Errorf("failed to create policy rule: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -1608,8 +1640,8 @@ func (c *Client) BulkCreatePolicyRules(ctx context.Context, specs []map[string]a
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk create policy rules: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk create policy rules: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp PolicyRulesBulkCreateResponse
@@ -1629,8 +1661,8 @@ func (c *Client) BulkUpdatePolicyRules(ctx context.Context, items []PolicyRuleBu
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk update policy rules: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk update policy rules: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp PolicyRulesBulkCreateResponse
@@ -1650,8 +1682,8 @@ func (c *Client) BulkDeletePolicyRules(ctx context.Context, items []PolicyRuleBu
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk delete policy rules: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk delete policy rules: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp PolicyRulesBulkCreateResponse
@@ -1664,7 +1696,7 @@ func (c *Client) BulkDeletePolicyRules(ctx context.Context, items []PolicyRuleBu
 
 // GetPolicyRule retrieves a policy rule by ID.
 func (c *Client) GetPolicyRule(ctx context.Context, id string) (map[string]interface{}, error) {
-	resp, err := c.doRequest(ctx, http.MethodGet, fmt.Sprintf("/api/v4.0/visibility/policy/rules/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodGet, c.pathf("/api/v4.0/visibility/policy/rules/%s", id), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1675,8 +1707,8 @@ func (c *Client) GetPolicyRule(ctx context.Context, id string) (map[string]inter
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get policy rule: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to get policy rule: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -1699,15 +1731,15 @@ func (c *Client) GetPolicyRule(ctx context.Context, id string) (map[string]inter
 
 // UpdatePolicyRule updates an existing policy rule.
 func (c *Client) UpdatePolicyRule(ctx context.Context, id string, spec map[string]interface{}) error {
-	resp, err := c.doRequest(ctx, http.MethodPut, fmt.Sprintf("/api/v4.0/visibility/policy/rules/%s", id), spec)
+	resp, err := c.doRequest(ctx, http.MethodPut, c.pathf("/api/v4.0/visibility/policy/rules/%s", id), spec)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to update policy rule: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to update policy rule: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1715,7 +1747,7 @@ func (c *Client) UpdatePolicyRule(ctx context.Context, id string, spec map[strin
 
 // DeletePolicyRule deletes a policy rule (uses POST to /delete/{id} per API spec).
 func (c *Client) DeletePolicyRule(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodPost, fmt.Sprintf("/api/v4.0/visibility/policy/rules/delete/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodPost, c.pathf("/api/v4.0/visibility/policy/rules/delete/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -1727,8 +1759,8 @@ func (c *Client) DeletePolicyRule(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete policy rule: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to delete policy rule: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1746,6 +1778,7 @@ func (c *Client) ListPolicyRules(ctx context.Context) ([]map[string]interface{},
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing policy rules; "+
+					"filters: none; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
 				page, len(allRules),
@@ -1765,9 +1798,9 @@ func (c *Client) ListPolicyRules(ctx context.Context) ([]map[string]interface{},
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list policy rules: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list policy rules: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListPolicyRulesResponse
@@ -1823,11 +1856,11 @@ func (c *Client) CreateDnsBlocklist(ctx context.Context, blocklist *DnsBlocklist
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return "", ErrDnsSecurityFeatureDisabled
 		}
-		return "", fmt.Errorf("failed to create DNS blocklist: status %d, body: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("failed to create DNS blocklist: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -1842,7 +1875,7 @@ func (c *Client) CreateDnsBlocklist(ctx context.Context, blocklist *DnsBlocklist
 // Uses the list endpoint with ids filter because the single-item GET endpoint
 // does not return the id field or proper type string.
 func (c *Client) GetDnsBlocklist(ctx context.Context, id string) (*DnsBlocklist, error) {
-	apiPath := fmt.Sprintf("/api/v4.0/dns_security?ids=%s&domains_limit=-1", id)
+	apiPath := fmt.Sprintf("/api/v4.0/dns_security?ids=%s&domains_limit=-1", url.QueryEscape(id))
 	resp, err := c.doRequest(ctx, http.MethodGet, apiPath, nil)
 	if err != nil {
 		return nil, err
@@ -1854,11 +1887,11 @@ func (c *Client) GetDnsBlocklist(ctx context.Context, id string) (*DnsBlocklist,
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return nil, ErrDnsSecurityFeatureDisabled
 		}
-		return nil, fmt.Errorf("failed to get DNS blocklist: status %d, body: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("failed to get DNS blocklist: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var listResp ListDnsBlocklistsResponse
@@ -1875,18 +1908,18 @@ func (c *Client) GetDnsBlocklist(ctx context.Context, id string) (*DnsBlocklist,
 
 // UpdateDnsBlocklist updates an existing DNS blocklist using PATCH.
 func (c *Client) UpdateDnsBlocklist(ctx context.Context, id string, blocklist *DnsBlocklistEdit) error {
-	resp, err := c.doRequest(ctx, http.MethodPatch, fmt.Sprintf("/api/v4.0/dns_security/%s", id), blocklist)
+	resp, err := c.doRequest(ctx, http.MethodPatch, c.pathf("/api/v4.0/dns_security/%s", id), blocklist)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return ErrDnsSecurityFeatureDisabled
 		}
-		return fmt.Errorf("failed to update DNS blocklist: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to update DNS blocklist: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1894,7 +1927,7 @@ func (c *Client) UpdateDnsBlocklist(ctx context.Context, id string, blocklist *D
 
 // DeleteDnsBlocklist deletes a DNS blocklist.
 func (c *Client) DeleteDnsBlocklist(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v4.0/dns_security/%s", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/dns_security/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -1906,11 +1939,11 @@ func (c *Client) DeleteDnsBlocklist(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return ErrDnsSecurityFeatureDisabled
 		}
-		return fmt.Errorf("failed to delete DNS blocklist: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to delete DNS blocklist: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -1928,9 +1961,10 @@ func (c *Client) ListDnsBlocklists(ctx context.Context, name, listType string) (
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing DNS blocklists; "+
+					"filters: name=%q type=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allBlocklists),
+				page, len(allBlocklists), name, listType,
 			)
 		}
 		page++
@@ -1954,12 +1988,12 @@ func (c *Client) ListDnsBlocklists(ctx context.Context, name, listType string) (
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
 			if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 				return nil, ErrDnsSecurityFeatureDisabled
 			}
-			return nil, fmt.Errorf("failed to list DNS blocklists: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list DNS blocklists: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListDnsBlocklistsResponse
@@ -1991,11 +2025,11 @@ func (c *Client) BulkCreateDnsBlocklists(ctx context.Context, blocklists []DnsBl
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return nil, ErrDnsSecurityFeatureDisabled
 		}
-		return nil, fmt.Errorf("failed to bulk create DNS blocklists: status %d, body: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("failed to bulk create DNS blocklists: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp BulkCreateDnsBlocklistResponse
@@ -2020,11 +2054,11 @@ func (c *Client) BulkDeleteDnsBlocklists(ctx context.Context, ids []string) erro
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return ErrDnsSecurityFeatureDisabled
 		}
-		return fmt.Errorf("failed to bulk delete DNS blocklists: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to bulk delete DNS blocklists: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2039,11 +2073,11 @@ func (c *Client) BulkEditDnsBlocklists(ctx context.Context, req *BulkEditDnsBloc
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return ErrDnsSecurityFeatureDisabled
 		}
-		return fmt.Errorf("failed to bulk edit DNS blocklists: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to bulk edit DNS blocklists: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2051,18 +2085,18 @@ func (c *Client) BulkEditDnsBlocklists(ctx context.Context, req *BulkEditDnsBloc
 
 // ResetDnsBlocklistHitCount resets the hit counter for a DNS blocklist.
 func (c *Client) ResetDnsBlocklistHitCount(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, fmt.Sprintf("/api/v4.0/dns_security/%s/hits", id), nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/dns_security/%s/hits", id), nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isDnsSecurityFeatureDisabled(resp.StatusCode, body) {
 			return ErrDnsSecurityFeatureDisabled
 		}
-		return fmt.Errorf("failed to reset DNS blocklist hit count: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to reset DNS blocklist hit count: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2080,8 +2114,8 @@ func (c *Client) CreateIncident(ctx context.Context, incident *IncidentCreate) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create incident: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return "", fmt.Errorf("failed to create incident: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateIncidentResponse
@@ -2113,8 +2147,8 @@ func (c *Client) GetIncident(ctx context.Context, id string) (map[string]interfa
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get incident: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to get incident: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var listResp ListIncidentsResponse
@@ -2141,9 +2175,10 @@ func (c *Client) ListIncidents(ctx context.Context, fromTime, toTime int64) ([]m
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing incidents; "+
+					"filters: from_time=%d to_time=%d; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allIncidents),
+				page, len(allIncidents), fromTime, toTime,
 			)
 		}
 		page++
@@ -2162,9 +2197,9 @@ func (c *Client) ListIncidents(ctx context.Context, fromTime, toTime int64) ([]m
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list incidents: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list incidents: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListIncidentsResponse
@@ -2197,8 +2232,8 @@ func (c *Client) BulkCreateIncidents(ctx context.Context, incidents []IncidentCr
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk create incidents: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk create incidents: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp BulkCreateIncidentResponse
@@ -2228,11 +2263,11 @@ func (c *Client) CreateWorksite(ctx context.Context, worksite *WorksiteCreate) (
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 			return "", ErrWorksitesFeatureDisabled
 		}
-		return "", fmt.Errorf("failed to create worksite: status %d, body: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("failed to create worksite: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -2270,11 +2305,11 @@ func (c *Client) UpdateWorksite(ctx context.Context, worksite *WorksiteUpdate) e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 			return ErrWorksitesFeatureDisabled
 		}
-		return fmt.Errorf("failed to update worksite: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to update worksite: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2304,11 +2339,11 @@ func (c *Client) BulkDeleteWorksites(ctx context.Context, ids []string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 			return ErrWorksitesFeatureDisabled
 		}
-		return fmt.Errorf("failed to delete worksite: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to delete worksite: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	if resp.StatusCode == http.StatusOK {
@@ -2363,9 +2398,10 @@ func (c *Client) ListWorksites(ctx context.Context, name string) ([]Worksite, er
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing worksites; "+
+					"filters: gc_filter=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allWorksites),
+				page, len(allWorksites), name,
 			)
 		}
 		page++
@@ -2385,12 +2421,12 @@ func (c *Client) ListWorksites(ctx context.Context, name string) ([]Worksite, er
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
 			if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 				return nil, ErrWorksitesFeatureDisabled
 			}
-			return nil, fmt.Errorf("failed to list worksites: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list worksites: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListWorksitesResponse
@@ -2423,8 +2459,8 @@ func (c *Client) CreateUserGroup(ctx context.Context, userGroup *UserGroupCreate
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to create user group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return "", fmt.Errorf("failed to create user group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var createResp CreateResponse
@@ -2455,15 +2491,15 @@ func (c *Client) GetUserGroup(ctx context.Context, id string) (*UserGroup, error
 
 // UpdateUserGroup updates an existing user group using PUT with ID in URL.
 func (c *Client) UpdateUserGroup(ctx context.Context, id string, userGroup *UserGroupCreate) error {
-	resp, err := c.doRequest(ctx, http.MethodPut, "/api/v4.0/visibility/user-groups/"+id, userGroup)
+	resp, err := c.doRequest(ctx, http.MethodPut, c.pathf("/api/v4.0/visibility/user-groups/%s", id), userGroup)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to update user group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to update user group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2471,7 +2507,7 @@ func (c *Client) UpdateUserGroup(ctx context.Context, id string, userGroup *User
 
 // DeleteUserGroup deletes a user group by ID.
 func (c *Client) DeleteUserGroup(ctx context.Context, id string) error {
-	resp, err := c.doRequest(ctx, http.MethodDelete, "/api/v4.0/visibility/user-groups/"+id, nil)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.pathf("/api/v4.0/visibility/user-groups/%s", id), nil)
 	if err != nil {
 		return err
 	}
@@ -2483,8 +2519,8 @@ func (c *Client) DeleteUserGroup(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete user group: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to delete user group: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2502,9 +2538,10 @@ func (c *Client) ListUserGroups(ctx context.Context, search string) ([]UserGroup
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing user groups; "+
+					"filters: search=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allUserGroups),
+				page, len(allUserGroups), search,
 			)
 		}
 		page++
@@ -2524,9 +2561,9 @@ func (c *Client) ListUserGroups(ctx context.Context, search string) ([]UserGroup
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list user groups: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list user groups: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListUserGroupsResponse
@@ -2569,8 +2606,8 @@ func (c *Client) GetAsset(ctx context.Context, id string) (*Asset, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to get asset: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to get asset: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var listResp ListAssetsResponse
@@ -2588,7 +2625,7 @@ func (c *Client) GetAsset(ctx context.Context, id string) (*Asset, error) {
 // DeleteAsset deactivates an asset by ID.
 // NOTE: The API DELETE endpoint deactivates the asset rather than permanently removing it.
 func (c *Client) DeleteAsset(ctx context.Context, id string) error {
-	apiPath := fmt.Sprintf("/api/v4.0/assets/%s", url.PathEscape(id))
+	apiPath := c.pathf("/api/v4.0/assets/%s", id)
 
 	resp, err := c.doRequest(ctx, http.MethodDelete, apiPath, nil)
 	if err != nil {
@@ -2601,8 +2638,8 @@ func (c *Client) DeleteAsset(ctx context.Context, id string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to deactivate asset: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to deactivate asset: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2620,9 +2657,10 @@ func (c *Client) ListAssets(ctx context.Context, name string) ([]Asset, error) {
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing assets; "+
+					"filters: name=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allAssets),
+				page, len(allAssets), name,
 			)
 		}
 		page++
@@ -2643,9 +2681,9 @@ func (c *Client) ListAssets(ctx context.Context, name string) ([]Asset, error) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list assets: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list assets: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListAssetsResponse
@@ -2677,8 +2715,8 @@ func (c *Client) BulkCreateAssets(ctx context.Context, assets []AssetCreate) (*B
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk create assets: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk create assets: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp BulkCreateAssetsResponse
@@ -2698,8 +2736,8 @@ func (c *Client) BulkUpdateAssets(ctx context.Context, assets []AssetBulkUpdateI
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to bulk update assets: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return nil, fmt.Errorf("failed to bulk update assets: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	var bulkResp BulkUpdateAssetsResponse
@@ -2724,8 +2762,8 @@ func (c *Client) BulkDeactivateAssets(ctx context.Context, assetIDs []string) er
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to bulk deactivate assets: status %d, body: %s", resp.StatusCode, string(body))
+		body := readErrorBody(resp)
+		return fmt.Errorf("failed to bulk deactivate assets: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2756,11 +2794,11 @@ func (c *Client) CreateUserGroupRevision(ctx context.Context, req *UserGroupRevi
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isUserGroupRevisionUnchanged(resp.StatusCode, body) {
 			return ErrUserGroupRevisionUnchanged
 		}
-		return fmt.Errorf("failed to create user group revision: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to create user group revision: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2775,11 +2813,11 @@ func (c *Client) CreatePolicyRevision(ctx context.Context, req *PolicyRevisionRe
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isPolicyRevisionUnchanged(resp.StatusCode, body) {
 			return ErrPolicyRevisionUnchanged
 		}
-		return fmt.Errorf("failed to create policy revision: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to create policy revision: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2794,11 +2832,11 @@ func (c *Client) AssignWorksite(ctx context.Context, req *WorksiteAssignRequest)
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 			return ErrWorksitesFeatureDisabled
 		}
-		return fmt.Errorf("failed to assign worksite: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to assign worksite: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2807,7 +2845,7 @@ func (c *Client) AssignWorksite(ctx context.Context, req *WorksiteAssignRequest)
 // MovePolicyRulesToWorksite moves policy rules to a worksite using the bulk move endpoint.
 // Use worksiteID "all_worksites" to unassign rules from their current worksite.
 func (c *Client) MovePolicyRulesToWorksite(ctx context.Context, worksiteID string, ruleIDs []string) error {
-	apiPath := fmt.Sprintf("/api/v3.0/visibility/policy/rules-bulk/worksite/move/%s", url.PathEscape(worksiteID))
+	apiPath := c.pathf("/api/v3.0/visibility/policy/rules-bulk/worksite/move/%s", worksiteID)
 
 	req := &PolicyRuleBulkWorksiteMoveRequest{
 		IDs:        ruleIDs,
@@ -2821,11 +2859,11 @@ func (c *Client) MovePolicyRulesToWorksite(ctx context.Context, worksiteID strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := readErrorBody(resp)
 		if isWorksiteFeatureDisabled(resp.StatusCode, body) {
 			return ErrWorksitesFeatureDisabled
 		}
-		return fmt.Errorf("failed to move policy rules to worksite: status %d, body: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to move policy rules to worksite: %w", parseAPIError(resp.StatusCode, body))
 	}
 
 	return nil
@@ -2845,9 +2883,10 @@ func (c *Client) ListAgentAggregators(ctx context.Context, hostname string) ([]A
 		if page >= settings.PaginationMaxPages {
 			return nil, fmt.Errorf(
 				"pagination safety limit reached: fetched %d pages (%d items) listing agent aggregators; "+
+					"filters: gc_filter=%q; "+
 					"the API may be returning inconsistent results, or the dataset is very large; "+
 					"consider narrowing your query with filters",
-				page, len(allAggregators),
+				page, len(allAggregators), hostname,
 			)
 		}
 		page++
@@ -2867,9 +2906,9 @@ func (c *Client) ListAgentAggregators(ctx context.Context, hostname string) ([]A
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body := readErrorBody(resp)
 			resp.Body.Close()
-			return nil, fmt.Errorf("failed to list agent aggregators: status %d, body: %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("failed to list agent aggregators: %w", parseAPIError(resp.StatusCode, body))
 		}
 
 		var listResp ListAgentAggregatorsResponse

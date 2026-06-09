@@ -21,10 +21,42 @@ import (
 // The field is create-only and may not appear in read responses for assets without orchestration details.
 const orchObjIDPlaceholder = "REPLACE_ME_orchestration_obj_id_not_returned_by_api"
 
+// Default file and directory permission modes for generated .tf files and the
+// output directory. Generated configs can contain inventory metadata (MAC
+// addresses, asset names, labels) that some users treat as sensitive, so
+// defaults are tight; callers can override via Importer.FileMode/DirMode (or
+// the CLI's --file-mode/--dir-mode flags).
+const (
+	DefaultFileMode os.FileMode = 0o600
+	DefaultDirMode  os.FileMode = 0o700
+)
+
 // Importer fetches all resources from Akamai Guardicore Segmentation and generates .tf files.
 type Importer struct {
 	Client    *client.Client
 	OutputDir string
+	// FileMode is the permission mode applied to generated .tf files. When zero,
+	// DefaultFileMode (0o600) is used.
+	FileMode os.FileMode
+	// DirMode is the permission mode applied to the output directory. When zero,
+	// DefaultDirMode (0o700) is used.
+	DirMode os.FileMode
+}
+
+// fileMode returns the configured file mode, defaulting to DefaultFileMode.
+func (i *Importer) fileMode() os.FileMode {
+	if i.FileMode == 0 {
+		return DefaultFileMode
+	}
+	return i.FileMode
+}
+
+// dirMode returns the configured directory mode, defaulting to DefaultDirMode.
+func (i *Importer) dirMode() os.FileMode {
+	if i.DirMode == 0 {
+		return DefaultDirMode
+	}
+	return i.DirMode
 }
 
 // Result contains a summary of the import operation.
@@ -376,7 +408,7 @@ func (imp *Importer) Run(ctx context.Context) (*Result, error) {
 	}
 
 	// Phase 3: Generate files
-	if err := os.MkdirAll(imp.OutputDir, 0755); err != nil {
+	if err := os.MkdirAll(imp.OutputDir, imp.dirMode()); err != nil {
 		return nil, fmt.Errorf("failed to create output directory: %w", err)
 	}
 
@@ -443,9 +475,9 @@ func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedReso
 
 		if _, isSM := systemManagedIDs[nr.ID]; isSM {
 			data := LabelTemplateData{
-				Name:  nr.Name,
-				Key:   l.Key,
-				Value: l.Value,
+				Name:     nr.Name,
+				KeyHCL:   formatHCLScalar(l.Key),
+				ValueHCL: formatHCLScalar(l.Value),
 			}
 			if err := labelDataTemplate.Execute(&buf, data); err != nil {
 				return fmt.Errorf("failed to render data label %s: %w", l.ID, err)
@@ -493,8 +525,8 @@ func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedReso
 			data := LabelTemplateData{
 				Name:     nr.Name,
 				ID:       l.ID,
-				Key:      l.Key,
-				Value:    l.Value,
+				KeyHCL:   formatHCLScalar(l.Key),
+				ValueHCL: formatHCLScalar(l.Value),
 				Criteria: criteria,
 			}
 
@@ -507,7 +539,7 @@ func (imp *Importer) generateLabelsFile(labels []client.Label, named []NamedReso
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "labels.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "labels.tf"), buf.Bytes(), imp.fileMode())
 }
 
 func (imp *Importer) generateLabelGroupsFile(groups []client.LabelGroup, named []NamedResource, lookup *ResourceLookup) error {
@@ -521,11 +553,11 @@ func (imp *Importer) generateLabelGroupsFile(groups []client.LabelGroup, named [
 		g := groupByID[nr.ID]
 
 		data := LabelGroupTemplateData{
-			Name:     nr.Name,
-			ID:       g.ID,
-			Key:      g.Key,
-			Value:    g.Value,
-			Comments: g.Comments,
+			Name:        nr.Name,
+			ID:          g.ID,
+			KeyHCL:      formatHCLScalar(g.Key),
+			ValueHCL:    formatHCLScalar(g.Value),
+			CommentsHCL: formatOptionalHCLString(g.Comments),
 		}
 
 		if g.IncludeLabels != nil && len(g.IncludeLabels.OrLabels) > 0 {
@@ -544,7 +576,7 @@ func (imp *Importer) generateLabelGroupsFile(groups []client.LabelGroup, named [
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "label_groups.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "label_groups.tf"), buf.Bytes(), imp.fileMode())
 }
 
 // buildLabelGroupSelectorHCL generates an HCL expression string for the typed
@@ -651,7 +683,7 @@ func (imp *Importer) generatePolicyRulesFile(rules []map[string]interface{}, loo
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "policy_rules.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "policy_rules.tf"), buf.Bytes(), imp.fileMode())
 }
 
 func (imp *Importer) generateDnsSecurityFile(blocklists []client.DnsBlocklist) error {
@@ -698,7 +730,7 @@ func (imp *Importer) generateDnsSecurityFile(blocklists []client.DnsBlocklist) e
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "dns_security.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "dns_security.tf"), buf.Bytes(), imp.fileMode())
 }
 
 func isSystemManagedDnsBlocklistType(listType string) bool {
@@ -773,7 +805,7 @@ func (imp *Importer) generateIncidentsFile(incidents []map[string]interface{}) e
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "incidents.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "incidents.tf"), buf.Bytes(), imp.fileMode())
 }
 
 func commentAllLines(value, prefix string) string {
@@ -828,7 +860,7 @@ func (imp *Importer) generateWorksitesFile(worksites []client.Worksite, named []
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "worksites.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "worksites.tf"), buf.Bytes(), imp.fileMode())
 }
 
 func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named []NamedResource, systemManagedIDs map[string]struct{}) (int, error) {
@@ -876,7 +908,7 @@ func (imp *Importer) generateUserGroupsFile(userGroups []client.UserGroup, named
 		written++
 	}
 
-	return written, os.WriteFile(filepath.Join(imp.OutputDir, "user_groups.tf"), buf.Bytes(), 0644)
+	return written, os.WriteFile(filepath.Join(imp.OutputDir, "user_groups.tf"), buf.Bytes(), imp.fileMode())
 }
 
 // shouldSkipUserGroup returns true if a user group should be skipped during import.
@@ -1096,7 +1128,7 @@ func (imp *Importer) generateAssetsFile(
 		var orchObjIDComment string
 		if orchObjID == "" {
 			orchObjID = orchObjIDPlaceholder
-			orchObjIDComment = "TODO: orchestration_obj_id is create-only and not returned by the API.\n  # Replace this placeholder with the actual value from your orchestration system."
+			orchObjIDComment = "Note: orchestration_obj_id is set at create-time only and not returned by the API.\n  # Replace this placeholder with the actual value from your orchestration system."
 		}
 
 		data := AssetTemplateData{
@@ -1123,7 +1155,7 @@ func (imp *Importer) generateAssetsFile(
 		written++
 	}
 
-	return written, os.WriteFile(filepath.Join(imp.OutputDir, "assets.tf"), buf.Bytes(), 0644)
+	return written, os.WriteFile(filepath.Join(imp.OutputDir, "assets.tf"), buf.Bytes(), imp.fileMode())
 }
 
 // buildPolicyRuleBodyHCL generates typed HCL attributes for a policy rule,
@@ -1430,5 +1462,5 @@ func (imp *Importer) generateAgentAggregatorsFile(aggregators []client.AgentAggr
 		}
 	}
 
-	return os.WriteFile(filepath.Join(imp.OutputDir, "agent_aggregators.tf"), buf.Bytes(), 0644)
+	return os.WriteFile(filepath.Join(imp.OutputDir, "agent_aggregators.tf"), buf.Bytes(), imp.fileMode())
 }

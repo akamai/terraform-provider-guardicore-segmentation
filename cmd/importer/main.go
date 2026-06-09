@@ -19,6 +19,8 @@ func main() {
 	insecure := flag.Bool("insecure", false, "Skip TLS certificate verification")
 	requestTimeout := flag.Int64("request-timeout", 0, fmt.Sprintf("HTTP request timeout in seconds (default: %d)", client.DefaultImporterRequestTimeout))
 	outputDir := flag.String("output-dir", ".", "Output directory for generated .tf files")
+	fileMode := flag.Uint("file-mode", uint(importer.DefaultFileMode), "Permission mode (octal) for generated .tf files (default: 0600)")
+	dirMode := flag.Uint("dir-mode", uint(importer.DefaultDirMode), "Permission mode (octal) for the output directory (default: 0700)")
 
 	flag.Parse()
 
@@ -56,6 +58,8 @@ func main() {
 	imp := &importer.Importer{
 		Client:    apiClient,
 		OutputDir: *outputDir,
+		FileMode:  os.FileMode(*fileMode),
+		DirMode:   os.FileMode(*dirMode),
 	}
 
 	ctx := context.Background()

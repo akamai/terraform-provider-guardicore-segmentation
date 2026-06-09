@@ -50,6 +50,10 @@ The importer supports the same authentication methods as the Terraform provider:
 | `--insecure` |                            | No | `false` | Skip TLS certificate verification |
 | `--request-timeout` | `GUARDICORE_REQUEST_TIMEOUT`      | No | `30` | HTTP request timeout in seconds |
 | `--output-dir` |                            | No | `.` | Directory for generated .tf files |
+| `--file-mode` |                            | No | `0600` | Permission mode (octal) for generated `.tf` files |
+| `--dir-mode` |                            | No | `0700` | Permission mode (octal) for the output directory |
+
+The default file (`0600`) and directory (`0700`) modes are intentionally restrictive because the generated configuration can contain inventory metadata (asset names, labels, NIC MAC addresses) that some users treat as sensitive. Pass `--file-mode=0644 --dir-mode=0755` to restore the previous, world-readable defaults. On Windows the bits are accepted but advisory — ACL inheritance from the parent folder governs actual access.
 
 ## Usage
 

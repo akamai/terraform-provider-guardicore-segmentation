@@ -3,14 +3,14 @@ package importer
 import "text/template"
 
 var labelDataTemplate = template.Must(template.New("label_data").Parse(`data "guardicore_label" "{{.Name}}" {
-  key   = "{{.Key}}"
-  value = "{{.Value}}"
+  key   = {{.KeyHCL}}
+  value = {{.ValueHCL}}
 }
 `))
 
 var labelTemplate = template.Must(template.New("label").Parse(`resource "guardicore_label" "{{.Name}}" {
-  key   = "{{.Key}}"
-  value = "{{.Value}}"
+  key   = {{.KeyHCL}}
+  value = {{.ValueHCL}}
 {{- if .Criteria}}
 
   criteria = [
@@ -44,10 +44,10 @@ import {
 `))
 
 var labelGroupTemplate = template.Must(template.New("label_group").Parse(`resource "guardicore_label_group" "{{.Name}}" {
-  key      = "{{.Key}}"
-  value    = "{{.Value}}"
-{{- if .Comments}}
-  comments = "{{.Comments}}"
+  key      = {{.KeyHCL}}
+  value    = {{.ValueHCL}}
+{{- if .CommentsHCL}}
+  comments = {{.CommentsHCL}}
 {{- end}}
 {{- if .Include}}
   include = {{.Include}}
@@ -81,8 +81,8 @@ import {
 type LabelTemplateData struct {
 	Name     string
 	ID       string
-	Key      string
-	Value    string
+	KeyHCL   string
+	ValueHCL string
 	Criteria []CriteriaData
 }
 
@@ -103,13 +103,13 @@ type CompoundCriteriaData struct {
 
 // LabelGroupTemplateData holds data for rendering a label group resource block.
 type LabelGroupTemplateData struct {
-	Name     string
-	ID       string
-	Key      string
-	Value    string
-	Comments string
-	Include  string
-	Exclude  string
+	Name        string
+	ID          string
+	KeyHCL      string
+	ValueHCL    string
+	CommentsHCL string
+	Include     string
+	Exclude     string
 }
 
 // PolicyRuleTemplateData holds data for rendering a policy rule resource block.

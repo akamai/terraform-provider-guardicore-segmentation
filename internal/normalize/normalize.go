@@ -5,6 +5,24 @@ import (
 	"sort"
 )
 
+var serverManagedRuleFields = map[string]bool{
+	"id":                   true,
+	"created_at":           true,
+	"updated_at":           true,
+	"author":               true,
+	"creation_time":        true,
+	"last_change_time":     true,
+	"hit_count":            true,
+	"hit_count_reset_time": true,
+	"last_hit":             true,
+	"state":                true,
+	"read_only":            true,
+	"objects":              true,
+	"worksite":             true,
+	"attributes":           true,
+	"creation_origin":      true,
+}
+
 func normalizePolicyRuleReferenceIDs(value interface{}) interface{} {
 	slice, ok := value.([]interface{})
 	if !ok {
@@ -90,30 +108,28 @@ func NormalizePolicyRuleSpec(rule map[string]interface{}) map[string]interface{}
 
 	filtered := make(map[string]interface{})
 	for key, value := range rule {
-		switch key {
-		case "id", "created_at", "updated_at", "author", "creation_time", "last_change_time", "hit_count", "hit_count_reset_time", "last_hit", "state", "read_only", "objects", "worksite", "attributes", "creation_origin":
+		if serverManagedRuleFields[key] {
 			continue
-		default:
-			if key == "comments" {
-				if comment, ok := value.(string); ok && comment == "" {
-					continue
-				}
-			}
-			if key == "ruleset_name" {
-				if name, ok := value.(string); ok && name == "" {
-					continue
-				}
-			}
-			if key == "network_profile" {
-				if profile, ok := value.(string); ok && profile == "CORPORATE" {
-					continue
-				}
-			}
-			if key == "schedule" && value == nil {
+		}
+		if key == "comments" {
+			if comment, ok := value.(string); ok && comment == "" {
 				continue
 			}
-			filtered[key] = value
 		}
+		if key == "ruleset_name" {
+			if name, ok := value.(string); ok && name == "" {
+				continue
+			}
+		}
+		if key == "network_profile" {
+			if profile, ok := value.(string); ok && profile == "CORPORATE" {
+				continue
+			}
+		}
+		if key == "schedule" && value == nil {
+			continue
+		}
+		filtered[key] = value
 	}
 
 	normalizedValue := NormalizeValue(filtered)
@@ -270,6 +286,11 @@ func NormalizePolicyRuleEndpoint(endpoint interface{}) interface{} {
 		mapped["policy_groups"] = normalizePolicyRuleReferenceIDs(mapped["policy_groups"])
 	}
 
+	// The API echoes label_group_ids back inside the policy_groups response field,
+	// even though they are distinct entities. Drop any policy_groups entries that
+	// duplicate label_group_ids so state and raw_json stay idempotent.
+	mapped = stripPolicyGroupsMirroringLabelGroupIDs(mapped)
+
 	if _, ok := mapped["labels"]; ok {
 		mapped["labels"] = normalizePolicyRuleLabelsExpression(mapped["labels"])
 		return mapped
@@ -316,6 +337,46 @@ func NormalizePolicyRuleEndpoint(endpoint interface{}) interface{} {
 	}
 
 	return map[string]interface{}{}
+}
+
+// stripPolicyGroupsMirroringLabelGroupIDs removes entries from `policy_groups`
+// that also appear in `label_group_ids` on the same endpoint. The API mirrors
+// label-group references into the response's `policy_groups` field even though
+// label groups and policy groups are different resource types; left in state,
+// the mirrored IDs cause non-idempotent plans.
+func stripPolicyGroupsMirroringLabelGroupIDs(endpoint map[string]interface{}) map[string]interface{} {
+	policyGroups, ok := endpoint["policy_groups"].([]interface{})
+	if !ok {
+		return endpoint
+	}
+	labelGroupIDs, ok := endpoint["label_group_ids"].([]interface{})
+	if !ok || len(labelGroupIDs) == 0 {
+		return endpoint
+	}
+
+	seen := make(map[string]struct{}, len(labelGroupIDs))
+	for _, raw := range labelGroupIDs {
+		if id, ok := raw.(string); ok {
+			seen[id] = struct{}{}
+		}
+	}
+
+	filtered := make([]interface{}, 0, len(policyGroups))
+	for _, raw := range policyGroups {
+		if id, ok := raw.(string); ok {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+		}
+		filtered = append(filtered, raw)
+	}
+
+	if len(filtered) == 0 {
+		delete(endpoint, "policy_groups")
+	} else {
+		endpoint["policy_groups"] = filtered
+	}
+	return endpoint
 }
 
 // normalizeMap normalizes a map by sorting its keys.

@@ -2,65 +2,12 @@ package provider
 
 import (
 	"context"
-	"flag"
-	"os"
+	"strings"
 	"testing"
 
 	frameworkprovider "github.com/hashicorp/terraform-plugin-framework/provider"
-	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 )
-
-// testAccProtoV6ProviderFactories is used to instantiate a provider during acceptance testing.
-// The factory function is called for each Terraform CLI command to create a provider
-// server that the CLI can connect to and interact with.
-var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
-	"guardicore": providerserver.NewProtocol6WithError(New("test")()),
-}
-
-// TestMain handles test initialization including flag parsing and config loading.
-func TestMain(m *testing.M) {
-	// Parse flags (including -test-config flag defined in testconfig_test.go)
-	flag.Parse()
-
-	// Keep non-acceptance runs safe for helper functions that reference testConfig.
-	testConfig = &TestConfig{}
-
-	// Load test config only if TF_ACC is set (acceptance tests mode)
-	if os.Getenv("TF_ACC") == "1" {
-		var err error
-		testConfig, err = loadTestConfig()
-		if err != nil {
-			// Print error but don't fail - let individual tests handle missing config
-			println("Warning: failed to load test config:", err.Error())
-		}
-	}
-
-	// Run tests
-	os.Exit(m.Run())
-}
-
-func testAccPreCheck(t *testing.T) {
-	// Verify config is loaded for acceptance tests
-	if testConfig == nil {
-		t.Skip("Test config not loaded. Set TF_ACC=1 and provide testconfig.json or environment variables")
-	}
-
-	// Verify required fields are set
-	if testConfig.BaseURL == "" {
-		t.Skip("GUARDICORE_BASE_URL must be set for acceptance tests")
-	}
-
-	// Verify at least one authentication method is configured
-	hasAccessToken := testConfig.AccessToken != ""
-	hasRefreshToken := testConfig.RefreshToken != ""
-	hasCredentials := testConfig.Username != "" && testConfig.Password != ""
-
-	if !hasAccessToken && !hasRefreshToken && !hasCredentials {
-		t.Skip("Authentication must be configured: GUARDICORE_ACCESS_TOKEN, GUARDICORE_REFRESH_TOKEN, or GUARDICORE_USERNAME+GUARDICORE_PASSWORD")
-	}
-}
 
 func TestGetStringValue(t *testing.T) {
 	t.Setenv("TEST_STRING_ENV", "from-env")
@@ -154,5 +101,57 @@ func TestNewReturnsProviderWithVersion(t *testing.T) {
 	}
 	if gcp.version != "1.2.3" {
 		t.Fatalf("expected version 1.2.3, got %q", gcp.version)
+	}
+}
+
+// TestInsecureSkipVerifyWarning covers F-02: the warning text must name the
+// targeted base_url so an operator scanning logs across providers can identify
+// which tenant has TLS verification disabled.
+func TestInsecureSkipVerifyWarning(t *testing.T) {
+	baseURL := "https://guardicore.example.com"
+	summary, detail := insecureSkipVerifyWarning(baseURL)
+
+	if summary != "TLS Certificate Verification Disabled" {
+		t.Fatalf("unexpected summary: %q", summary)
+	}
+	if !strings.Contains(detail, baseURL) {
+		t.Fatalf("expected detail to contain base_url %q, got: %q", baseURL, detail)
+	}
+	if !strings.Contains(detail, "man-in-the-middle") {
+		t.Fatalf("expected detail to retain MITM warning, got: %q", detail)
+	}
+}
+
+func TestValidateBaseURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "https ok", input: "https://guardicore.example.com", want: "https"},
+		{name: "http allowed", input: "http://guardicore.example.com", want: "http"},
+		{name: "missing scheme", input: "guardicore.example.com", wantErr: true},
+		{name: "unsupported scheme", input: "ftp://guardicore.example.com", wantErr: true},
+		{name: "missing host", input: "https:///", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateBaseURL(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected scheme %q, got %q", tc.want, got)
+			}
+		})
 	}
 }

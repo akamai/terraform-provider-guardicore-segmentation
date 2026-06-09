@@ -548,6 +548,47 @@ func TestNormalizePolicyRuleEndpoint_PolicyGroupsAlone(t *testing.T) {
 	}
 }
 
+func TestNormalizePolicyRuleEndpoint_PolicyGroupsMirrorsLabelGroupIDs(t *testing.T) {
+	endpoint := map[string]interface{}{
+		"label_group_ids": []interface{}{"lg-1", "lg-2"},
+		"policy_groups":   []interface{}{"lg-1", "lg-2"},
+	}
+	result := NormalizePolicyRuleEndpoint(endpoint)
+	mapped, ok := result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", result)
+	}
+	if _, ok := mapped["policy_groups"]; ok {
+		t.Errorf("expected policy_groups to be removed when it mirrors label_group_ids, got %v", mapped["policy_groups"])
+	}
+	lgs, ok := mapped["label_group_ids"].([]interface{})
+	if !ok || len(lgs) != 2 {
+		t.Fatalf("expected label_group_ids preserved with 2 entries, got %v", mapped["label_group_ids"])
+	}
+}
+
+func TestNormalizePolicyRuleEndpoint_PolicyGroupsPartialOverlap(t *testing.T) {
+	endpoint := map[string]interface{}{
+		"label_group_ids": []interface{}{"lg-1", "lg-2"},
+		"policy_groups":   []interface{}{"lg-1", "pg-only"},
+	}
+	result := NormalizePolicyRuleEndpoint(endpoint)
+	mapped, ok := result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", result)
+	}
+	pgs, ok := mapped["policy_groups"].([]interface{})
+	if !ok {
+		t.Fatalf("expected policy_groups to remain a list, got %T", mapped["policy_groups"])
+	}
+	if len(pgs) != 1 {
+		t.Fatalf("expected one remaining policy_groups entry, got %v", pgs)
+	}
+	if pgs[0] != "pg-only" {
+		t.Errorf("expected remaining entry to be \"pg-only\", got %v", pgs[0])
+	}
+}
+
 func TestNormalizePolicyRuleEndpoint_DomainsAlone(t *testing.T) {
 	endpoint := map[string]interface{}{"domains": []interface{}{"example.com"}}
 	result := NormalizePolicyRuleEndpoint(endpoint)
