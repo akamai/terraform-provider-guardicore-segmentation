@@ -8,11 +8,108 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
 )
+
+// TestImporterDefaultFileAndDirModes covers F-04: generated .tf files default
+// to 0600 and the output directory defaults to 0700. Unix permission bits are
+// only meaningful on Unix-like OSes — Windows uses ACL inheritance, so we
+// skip the assertion there (the bits are accepted but advisory).
+func TestImporterDefaultFileAndDirModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not enforced on Windows; ACLs govern access")
+	}
+
+	tmpDir := filepath.Join(t.TempDir(), "out")
+	imp := &Importer{OutputDir: tmpDir}
+
+	// Exercise both code paths: directory creation (MkdirAll) and file write.
+	if err := os.MkdirAll(imp.OutputDir, imp.dirMode()); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := imp.generateLabelsFile(nil, nil, nil); err != nil {
+		t.Fatalf("generateLabelsFile: %v", err)
+	}
+
+	dirInfo, err := os.Stat(tmpDir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != DefaultDirMode {
+		t.Fatalf("dir mode = %o, want %o", got, DefaultDirMode)
+	}
+
+	fileInfo, err := os.Stat(filepath.Join(tmpDir, "labels.tf"))
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != DefaultFileMode {
+		t.Fatalf("file mode = %o, want %o", got, DefaultFileMode)
+	}
+}
+
+// TestImporterOverrideFileAndDirModes covers F-04: callers can override the
+// default modes via the FileMode/DirMode fields (used by the CLI's
+// --file-mode/--dir-mode flags).
+func TestImporterOverrideFileAndDirModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not enforced on Windows; ACLs govern access")
+	}
+
+	tmpDir := filepath.Join(t.TempDir(), "out")
+	imp := &Importer{
+		OutputDir: tmpDir,
+		FileMode:  0o644,
+		DirMode:   0o755,
+	}
+
+	if err := os.MkdirAll(imp.OutputDir, imp.dirMode()); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := imp.generateLabelsFile(nil, nil, nil); err != nil {
+		t.Fatalf("generateLabelsFile: %v", err)
+	}
+
+	dirInfo, err := os.Stat(tmpDir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o755 {
+		t.Fatalf("dir mode = %o, want %o", got, 0o755)
+	}
+
+	fileInfo, err := os.Stat(filepath.Join(tmpDir, "labels.tf"))
+	if err != nil {
+		t.Fatalf("stat file: %v", err)
+	}
+	if got := fileInfo.Mode().Perm(); got != 0o644 {
+		t.Fatalf("file mode = %o, want %o", got, 0o644)
+	}
+}
+
+// TestImporterModeAccessors covers F-04: the fileMode/dirMode accessors must
+// fall back to the documented defaults when callers leave the fields zero.
+func TestImporterModeAccessors(t *testing.T) {
+	zero := &Importer{}
+	if got := zero.fileMode(); got != DefaultFileMode {
+		t.Fatalf("zero.fileMode() = %o, want %o", got, DefaultFileMode)
+	}
+	if got := zero.dirMode(); got != DefaultDirMode {
+		t.Fatalf("zero.dirMode() = %o, want %o", got, DefaultDirMode)
+	}
+
+	override := &Importer{FileMode: 0o640, DirMode: 0o750}
+	if got := override.fileMode(); got != 0o640 {
+		t.Fatalf("override.fileMode() = %o, want %o", got, 0o640)
+	}
+	if got := override.dirMode(); got != 0o750 {
+		t.Fatalf("override.dirMode() = %o, want %o", got, 0o750)
+	}
+}
 
 func TestGenerateLabelsFile(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -125,6 +222,56 @@ func TestGenerateLabelsFile_MultipleFlatCriteria(t *testing.T) {
 	}
 	if strings.Contains(s, `field    = ""`) || strings.Contains(s, `op       = ""`) || strings.Contains(s, `argument = ""`) {
 		t.Fatalf("expected no blank placeholder criteria values, got:\n%s", s)
+	}
+}
+
+func TestGenerateLabelsFile_EscapesSpecialCharacters(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	imp := &Importer{OutputDir: tmpDir}
+
+	special := `!@#$%^&*=+.\<>}{][`
+	labels := []client.Label{
+		{
+			ID:    "label-1",
+			Key:   special,
+			Value: special,
+		},
+		{
+			ID:    "label-2",
+			Key:   special,
+			Value: special,
+		},
+	}
+
+	named := DeduplicateNames(map[string]string{
+		"label-1": "special_managed",
+		"label-2": "special_data",
+	})
+
+	err := imp.generateLabelsFile(labels, named, map[string]struct{}{"label-2": {}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "labels.tf"))
+	if err != nil {
+		t.Fatalf("failed to read labels.tf: %v", err)
+	}
+
+	s := string(content)
+
+	if !strings.Contains(s, `resource "guardicore_label" "special_managed"`) {
+		t.Fatalf("expected managed label block, got:\n%s", s)
+	}
+	if !strings.Contains(s, `data "guardicore_label" "special_data"`) {
+		t.Fatalf("expected data label block, got:\n%s", s)
+	}
+	if !strings.Contains(s, `key   = "!@#$%^&*=+.\\<>}{]["`) {
+		t.Fatalf("expected key to escape backslash for valid HCL, got:\n%s", s)
+	}
+	if !strings.Contains(s, `value = "!@#$%^&*=+.\\<>}{]["`) {
+		t.Fatalf("expected value to escape backslash for valid HCL, got:\n%s", s)
 	}
 }
 
@@ -313,6 +460,56 @@ func TestGenerateLabelGroupsFile(t *testing.T) {
 	}
 	if strings.Contains(s, `resource "centra_label_group"`) || strings.Contains(s, "to = centra_label_group.") {
 		t.Error("expected importer to avoid legacy centra label group syntax")
+	}
+}
+
+func TestGenerateLabelGroupsFile_EscapesSpecialCharacters(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	imp := &Importer{OutputDir: tmpDir}
+
+	special := `!@#$%^&*=+.\<>}{][`
+	groups := []client.LabelGroup{
+		{
+			ID:       "group-1",
+			Key:      special,
+			Value:    special,
+			Comments: special,
+		},
+	}
+
+	named := DeduplicateNames(map[string]string{"group-1": "special_group"})
+	lookup := &ResourceLookup{
+		Labels:       map[string]string{},
+		LabelGroups:  map[string]string{},
+		PolicyGroups: map[string]string{},
+		UserGroups:   map[string]string{},
+		Assets:       map[string]string{},
+	}
+
+	err := imp.generateLabelGroupsFile(groups, named, lookup)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(tmpDir, "label_groups.tf"))
+	if err != nil {
+		t.Fatalf("failed to read label_groups.tf: %v", err)
+	}
+
+	s := string(content)
+
+	if !strings.Contains(s, `resource "guardicore_label_group" "special_group"`) {
+		t.Fatalf("expected label group block, got:\n%s", s)
+	}
+	if !strings.Contains(s, `key      = "!@#$%^&*=+.\\<>}{]["`) {
+		t.Fatalf("expected key to escape backslash for valid HCL, got:\n%s", s)
+	}
+	if !strings.Contains(s, `value    = "!@#$%^&*=+.\\<>}{]["`) {
+		t.Fatalf("expected value to escape backslash for valid HCL, got:\n%s", s)
+	}
+	if !strings.Contains(s, `comments = "!@#$%^&*=+.\\<>}{]["`) {
+		t.Fatalf("expected comments to escape backslash for valid HCL, got:\n%s", s)
 	}
 }
 
@@ -1108,8 +1305,8 @@ func TestGenerateAssetsFile_EmptyOrchestrationObjID(t *testing.T) {
 	if !strings.Contains(s, orchObjIDPlaceholder) {
 		t.Errorf("expected placeholder %q in output", orchObjIDPlaceholder)
 	}
-	if !strings.Contains(s, "# TODO") {
-		t.Error("expected TODO comment explaining the placeholder")
+	if !strings.Contains(s, "# Note:") {
+		t.Error("expected Note comment explaining the placeholder")
 	}
 }
 

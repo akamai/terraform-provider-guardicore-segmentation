@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -21,6 +22,70 @@ const (
 	testJWTNew       = "eyJ0.new.token"
 	testJWTOld       = "eyJ0.old.token"
 )
+
+// TestPathf covers F-03: the pathf helper must url.PathEscape every variadic
+// segment so caller-supplied IDs cannot escape their path segment via "/",
+// "?", "#", "%", or other reserved characters.
+func TestPathf(t *testing.T) {
+	c := &Client{}
+	cases := []struct {
+		name   string
+		format string
+		parts  []string
+		want   string
+	}{
+		{
+			name:   "plain id",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{"abc-123"},
+			want:   "/api/v4.0/labels/abc-123",
+		},
+		{
+			name:   "id with slash",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{"a/b"},
+			want:   "/api/v4.0/labels/a%2Fb",
+		},
+		{
+			name:   "id with question mark",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{"a?b"},
+			want:   "/api/v4.0/labels/a%3Fb",
+		},
+		{
+			name:   "id with hash",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{"a#b"},
+			want:   "/api/v4.0/labels/a%23b",
+		},
+		{
+			name:   "id with percent",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{"a%2Fb"},
+			want:   "/api/v4.0/labels/a%252Fb",
+		},
+		{
+			name:   "empty id",
+			format: "/api/v4.0/labels/%s",
+			parts:  []string{""},
+			want:   "/api/v4.0/labels/",
+		},
+		{
+			name:   "multi-segment",
+			format: "/api/v3.0/visibility/labels/%s/dynamic-criteria/%s",
+			parts:  []string{"label/1", "criteria?2"},
+			want:   "/api/v3.0/visibility/labels/label%2F1/dynamic-criteria/criteria%3F2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := c.pathf(tc.format, tc.parts...)
+			if got != tc.want {
+				t.Fatalf("pathf(%q, %v) = %q, want %q", tc.format, tc.parts, got, tc.want)
+			}
+		})
+	}
+}
 
 // writeJSON is a test helper that writes JSON response and handles encoding errors.
 func writeJSON(t *testing.T, w http.ResponseWriter, v interface{}) {
@@ -2918,6 +2983,9 @@ func TestClient_ListAssets_PaginationSafetyLimit(t *testing.T) {
 	if !strings.Contains(err.Error(), "pagination safety limit reached") {
 		t.Errorf("expected 'pagination safety limit reached' error, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), `filters: name=""`) {
+		t.Errorf("expected filters in pagination safety-limit error, got: %v", err)
+	}
 }
 
 func TestClient_ListAssets_TotalFieldName(t *testing.T) {
@@ -3375,7 +3443,7 @@ func TestClient_CreateWorksite_FeatureDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -3524,7 +3592,7 @@ func TestClient_UpdateWorksite_FeatureDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -3722,7 +3790,7 @@ func TestClient_DeleteWorksite_FeatureDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -3848,7 +3916,7 @@ func TestClient_ListWorksites_FeatureDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -4426,6 +4494,9 @@ func TestClient_ListLabels_PaginationSafetyLimit(t *testing.T) {
 	if !strings.Contains(err.Error(), "pagination safety limit reached") {
 		t.Errorf("expected 'pagination safety limit reached' error, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), `filters: key="" value=""`) {
+		t.Errorf("expected filters in pagination safety-limit error, got: %v", err)
+	}
 }
 
 func TestClient_CreateLabelGroup_Error(t *testing.T) {
@@ -4918,7 +4989,7 @@ func TestClient_CreateDnsBlocklist_FeatureDisabled(t *testing.T) {
 	}
 
 	_, err := client.CreateDnsBlocklist(context.Background(), &DnsBlocklistCreate{Name: "test", Type: "CUSTOM_BLOCK"})
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -4937,7 +5008,7 @@ func TestClient_GetDnsBlocklist_FeatureDisabled(t *testing.T) {
 	}
 
 	_, err := client.GetDnsBlocklist(context.Background(), "dns-123")
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -4956,7 +5027,7 @@ func TestClient_UpdateDnsBlocklist_FeatureDisabled(t *testing.T) {
 	}
 
 	err := client.UpdateDnsBlocklist(context.Background(), "dns-123", &DnsBlocklistEdit{})
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -4975,7 +5046,7 @@ func TestClient_DeleteDnsBlocklist_FeatureDisabled(t *testing.T) {
 	}
 
 	err := client.DeleteDnsBlocklist(context.Background(), "dns-123")
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -4994,7 +5065,7 @@ func TestClient_ListDnsBlocklists_FeatureDisabled(t *testing.T) {
 	}
 
 	_, err := client.ListDnsBlocklists(context.Background(), "", "")
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -5013,7 +5084,7 @@ func TestClient_BulkCreateDnsBlocklists_FeatureDisabled(t *testing.T) {
 	}
 
 	_, err := client.BulkCreateDnsBlocklists(context.Background(), []DnsBlocklistCreate{{Name: "test", Type: "CUSTOM_BLOCK"}})
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -5032,7 +5103,7 @@ func TestClient_BulkDeleteDnsBlocklists_FeatureDisabled(t *testing.T) {
 	}
 
 	err := client.BulkDeleteDnsBlocklists(context.Background(), []string{"id-1"})
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -5051,7 +5122,7 @@ func TestClient_BulkEditDnsBlocklists_FeatureDisabled(t *testing.T) {
 	}
 
 	err := client.BulkEditDnsBlocklists(context.Background(), &BulkEditDnsBlocklistRequest{Items: []BulkEditDnsBlocklistItem{{ID: "id-1"}}})
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -5070,7 +5141,7 @@ func TestClient_ResetDnsBlocklistHitCount_FeatureDisabled(t *testing.T) {
 	}
 
 	err := client.ResetDnsBlocklistHitCount(context.Background(), "id-1")
-	if err != ErrDnsSecurityFeatureDisabled {
+	if !errors.Is(err, ErrDnsSecurityFeatureDisabled) {
 		t.Errorf("expected ErrDnsSecurityFeatureDisabled, got: %v", err)
 	}
 }
@@ -5165,7 +5236,7 @@ func TestClient_AssignWorksite_FeatureDisabled(t *testing.T) {
 		EntityType: "asset",
 		EntityIDs:  []string{"a-1"},
 	})
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -5241,7 +5312,7 @@ func TestClient_MovePolicyRulesToWorksite_FeatureDisabled(t *testing.T) {
 	}
 
 	err := c.MovePolicyRulesToWorksite(context.Background(), "ws-1", []string{"r-1"})
-	if err != ErrWorksitesFeatureDisabled {
+	if !errors.Is(err, ErrWorksitesFeatureDisabled) {
 		t.Errorf("expected ErrWorksitesFeatureDisabled, got: %v", err)
 	}
 }
@@ -5730,7 +5801,7 @@ func TestClient_RetryOn429_StopsAfterMaxRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to get label: status 429") {
+	if !strings.Contains(err.Error(), "API error 429") {
 		t.Fatalf("expected status 429 error, got %v", err)
 	}
 	if got := atomic.LoadInt32(&callCount); got != 3 {
@@ -5763,7 +5834,7 @@ func TestClient_NoRetryOn403(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to get label: status 403") {
+	if !strings.Contains(err.Error(), "API error 403") {
 		t.Fatalf("expected status 403 error, got %v", err)
 	}
 	if got := atomic.LoadInt32(&callCount); got != 1 {
@@ -5863,7 +5934,7 @@ func TestClient_ForbiddenOnResourceOperation_NotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to bulk update assets: status 403") {
+	if !strings.Contains(err.Error(), "API error 403") {
 		t.Fatalf("expected status 403 error, got %v", err)
 	}
 	if got := atomic.LoadInt32(&callCount); got != 1 {
@@ -6420,4 +6491,93 @@ func TestBulkValidationError_Error(t *testing.T) {
 	if !strings.Contains(errStr, "bulk validation error") {
 		t.Fatalf("expected 'bulk validation error' prefix, got: %s", errStr)
 	}
+}
+
+func TestBulkValidationError_Error_EmptyItemErrors(t *testing.T) {
+	bve := &BulkValidationError{
+		StatusCode: 400,
+		ItemErrors: map[int]*BulkItemError{},
+		RawBody:    `{"error":"should not be exposed"}`,
+	}
+
+	errStr := bve.Error()
+	if !strings.Contains(errStr, "see TF_LOG=DEBUG for full body") {
+		t.Fatalf("expected debug hint in fallback message, got: %s", errStr)
+	}
+	if strings.Contains(errStr, "should not be exposed") {
+		t.Fatalf("expected raw body to be redacted, got: %s", errStr)
+	}
+}
+
+func TestReadErrorBody(t *testing.T) {
+	t.Run("returns body", func(t *testing.T) {
+		resp := &http.Response{Body: io.NopCloser(strings.NewReader("body text"))}
+		got := readErrorBody(resp)
+		if string(got) != "body text" {
+			t.Fatalf("expected body text, got %q", string(got))
+		}
+	})
+
+	t.Run("nil response", func(t *testing.T) {
+		got := readErrorBody(nil)
+		if !strings.Contains(string(got), "empty response body") {
+			t.Fatalf("expected empty response body marker, got %q", string(got))
+		}
+	})
+
+	t.Run("body read failure", func(t *testing.T) {
+		resp := &http.Response{Body: errReadCloser{err: fmt.Errorf("boom")}}
+		got := readErrorBody(resp)
+		if !strings.Contains(string(got), "failed to read response body") {
+			t.Fatalf("expected read failure marker, got %q", string(got))
+		}
+	})
+}
+
+func TestRetryDelay_JitterToggle(t *testing.T) {
+	baseDelay := 200 * time.Millisecond
+	client := &Client{settings: RuntimeSettings{
+		RequestMaxRetries:     3,
+		RequestRetryBaseDelay: baseDelay,
+		RequestRetryMaxDelay:  2 * time.Second,
+		RetryJitter:           false,
+	}}
+
+	delay := client.retryDelay(nil, 2)
+	if delay != baseDelay*2 {
+		t.Fatalf("expected deterministic delay without jitter, got %s", delay)
+	}
+
+	client = &Client{settings: RuntimeSettings{
+		RequestMaxRetries:     3,
+		RequestRetryBaseDelay: baseDelay,
+		RequestRetryMaxDelay:  2 * time.Second,
+		RetryJitter:           true,
+	}}
+	seenDifferent := false
+	for i := 0; i < 10; i++ {
+		d := client.retryDelay(nil, 2)
+		if d != baseDelay*2 {
+			seenDifferent = true
+			break
+		}
+	}
+	if !seenDifferent {
+		t.Fatal("expected jitter to vary delay at least once")
+	}
+}
+
+type errReadCloser struct {
+	err error
+}
+
+func (e errReadCloser) Read(_ []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	return 0, io.EOF
+}
+
+func (e errReadCloser) Close() error {
+	return nil
 }

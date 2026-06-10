@@ -18,6 +18,7 @@ fmt:
 	gofmt -s -w -e .
 
 test:
+	$(GO) run ./tools/check_test_conventions.go
 	$(GO) test -v -cover -timeout=120s -parallel=10 ./...
 
 testacc: export TF_ACC=1

@@ -3,10 +3,23 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/agentaggregator"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/asset"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/common"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/dnssecurity"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/incident"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/label"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/labelgroup"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/policygroup"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/policyrule"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/usergroup"
+	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/provider/worksite"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
@@ -123,16 +136,44 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 		return
 	}
 
-	if insecureSkipVerify {
-		resp.Diagnostics.AddWarning(
-			"TLS Certificate Verification Disabled",
-			"The provider is configured with insecure_skip_verify = true. "+
-				"This disables TLS certificate verification, making connections susceptible to "+
-				"man-in-the-middle attacks. Only use this for development or testing "+
-				"with self-signed certificates.",
+	baseURLScheme, err := validateBaseURL(baseURL)
+	if err != nil {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("base_url"),
+			"Invalid Base URL",
+			err.Error(),
 		)
+		return
+	}
+
+	switch baseURLScheme {
+	case "https":
+		// secure default; no action needed
+	case "http":
+		resp.Diagnostics.AddWarning(
+			"Insecure Base URL Scheme",
+			"The provider is configured with an insecure HTTP base_url. "+
+				"Credentials and tokens may be exposed over the network. "+
+				"Use HTTPS whenever possible.",
+		)
+		tflog.Warn(ctx, "Provider base_url uses insecure HTTP scheme", map[string]any{
+			"base_url": baseURL,
+		})
+	default:
+		resp.Diagnostics.AddAttributeError(
+			path.Root("base_url"),
+			"Unsupported Base URL Scheme",
+			"base_url must use http or https.",
+		)
+		return
+	}
+
+	if insecureSkipVerify {
+		summary, detail := insecureSkipVerifyWarning(baseURL)
+		resp.Diagnostics.AddWarning(summary, detail)
 		tflog.Warn(ctx, "TLS certificate verification is disabled", map[string]any{
 			"insecure_skip_verify": true,
+			"base_url":             baseURL,
 		})
 	}
 
@@ -175,7 +216,7 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 		RuntimeSettings:    nil,
 	}
 	runtime := client.ResolveRuntimeSettings(config.RuntimeSettings)
-	assetLabelIgnoreCache := newAssetLabelIgnoreCache()
+	assetLabelIgnoreCache := common.NewAssetLabelIgnoreCache()
 
 	// Create the API client
 	apiClient, err := client.NewClient(config)
@@ -191,30 +232,30 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 
 	// Wrap the client with provider-level configuration
 	strictRefs := data.StrictRefsOnDestroy.ValueBool()
-	providerData := &ProviderData{
+	providerData := &common.ProviderData{
 		Client:                   apiClient,
 		RuntimeSettings:          runtime,
 		AssetLabelIgnoreCache:    assetLabelIgnoreCache,
-		LabelCreateBatcher:       NewLabelCreateBatcher(apiClient, runtime.Batchers.Label.Create),
-		LabelUpdateBatcher:       NewLabelUpdateBatcher(apiClient, runtime.Batchers.Label.Update),
-		LabelDeleteBatcher:       NewLabelDeleteBatcher(apiClient, runtime.Batchers.Label.Delete),
-		PolicyRuleCreateBatcher:  NewPolicyRuleCreateBatcher(apiClient, runtime.Batchers.PolicyRule.Create),
-		PolicyRuleUpdateBatcher:  NewPolicyRuleUpdateBatcher(apiClient, runtime.Batchers.PolicyRule.Update),
-		PolicyRuleDeleteBatcher:  NewPolicyRuleDeleteBatcher(apiClient, runtime.Batchers.PolicyRule.Delete),
-		LabelGroupCreateBatcher:  NewLabelGroupCreateBatcher(apiClient, runtime.Batchers.LabelGroup.Create),
-		LabelGroupUpdateBatcher:  NewLabelGroupUpdateBatcher(apiClient, runtime.Batchers.LabelGroup.Update),
-		LabelGroupDeleteBatcher:  NewLabelGroupDeleteBatcher(apiClient, runtime.Batchers.LabelGroup.Delete),
-		UserGroupCreateBatcher:   NewUserGroupCreateBatcher(apiClient, runtime.Batchers.UserGroup.Create),
-		UserGroupUpdateBatcher:   NewUserGroupUpdateBatcher(apiClient, runtime.Batchers.UserGroup.Update),
-		UserGroupDeleteBatcher:   NewUserGroupDeleteBatcher(apiClient, runtime.Batchers.UserGroup.Delete),
-		AssetCreateBatcher:       NewAssetCreateBatcher(apiClient, runtime.Batchers.Asset.Create),
-		AssetUpdateBatcher:       NewAssetUpdateBatcher(apiClient, runtime.Batchers.Asset.Update),
-		AssetDeleteBatcher:       NewAssetDeleteBatcher(apiClient, runtime.Batchers.Asset.Delete),
-		DnsSecurityCreateBatcher: NewDnsSecurityCreateBatcher(apiClient, runtime.Batchers.DnsSecurity.Create),
-		DnsSecurityUpdateBatcher: NewDnsSecurityUpdateBatcher(apiClient, runtime.Batchers.DnsSecurity.Update),
-		DnsSecurityDeleteBatcher: NewDnsSecurityDeleteBatcher(apiClient, runtime.Batchers.DnsSecurity.Delete),
-		IncidentCreateBatcher:    NewIncidentCreateBatcher(apiClient, runtime.Batchers.Incident.Create),
-		WorksiteDeleteBatcher:    NewWorksiteDeleteBatcher(apiClient, runtime.Batchers.Worksite.Delete),
+		LabelCreateBatcher:       label.NewLabelCreateBatcher(apiClient, runtime.Batchers.Label.Create),
+		LabelUpdateBatcher:       label.NewLabelUpdateBatcher(apiClient, runtime.Batchers.Label.Update),
+		LabelDeleteBatcher:       label.NewLabelDeleteBatcher(apiClient, runtime.Batchers.Label.Delete),
+		PolicyRuleCreateBatcher:  policyrule.NewPolicyRuleCreateBatcher(apiClient, runtime.Batchers.PolicyRule.Create),
+		PolicyRuleUpdateBatcher:  policyrule.NewPolicyRuleUpdateBatcher(apiClient, runtime.Batchers.PolicyRule.Update),
+		PolicyRuleDeleteBatcher:  policyrule.NewPolicyRuleDeleteBatcher(apiClient, runtime.Batchers.PolicyRule.Delete),
+		LabelGroupCreateBatcher:  labelgroup.NewLabelGroupCreateBatcher(apiClient, runtime.Batchers.LabelGroup.Create),
+		LabelGroupUpdateBatcher:  labelgroup.NewLabelGroupUpdateBatcher(apiClient, runtime.Batchers.LabelGroup.Update),
+		LabelGroupDeleteBatcher:  labelgroup.NewLabelGroupDeleteBatcher(apiClient, runtime.Batchers.LabelGroup.Delete),
+		UserGroupCreateBatcher:   usergroup.NewUserGroupCreateBatcher(apiClient, runtime.Batchers.UserGroup.Create),
+		UserGroupUpdateBatcher:   usergroup.NewUserGroupUpdateBatcher(apiClient, runtime.Batchers.UserGroup.Update),
+		UserGroupDeleteBatcher:   usergroup.NewUserGroupDeleteBatcher(apiClient, runtime.Batchers.UserGroup.Delete),
+		AssetCreateBatcher:       asset.NewAssetCreateBatcher(apiClient, runtime.Batchers.Asset.Create),
+		AssetUpdateBatcher:       asset.NewAssetUpdateBatcher(apiClient, runtime.Batchers.Asset.Update),
+		AssetDeleteBatcher:       asset.NewAssetDeleteBatcher(apiClient, runtime.Batchers.Asset.Delete),
+		DnsSecurityCreateBatcher: dnssecurity.NewDnsSecurityCreateBatcher(apiClient, runtime.Batchers.DnsSecurity.Create),
+		DnsSecurityUpdateBatcher: dnssecurity.NewDnsSecurityUpdateBatcher(apiClient, runtime.Batchers.DnsSecurity.Update),
+		DnsSecurityDeleteBatcher: dnssecurity.NewDnsSecurityDeleteBatcher(apiClient, runtime.Batchers.DnsSecurity.Delete),
+		IncidentCreateBatcher:    incident.NewIncidentCreateBatcher(apiClient, runtime.Batchers.Incident.Create),
+		WorksiteDeleteBatcher:    worksite.NewWorksiteDeleteBatcher(apiClient, runtime.Batchers.Worksite.Delete),
 		ValidateRefsOnDestroy:    data.ValidateRefsOnDestroy.ValueBool() || strictRefs,
 		StrictRefsOnDestroy:      strictRefs,
 	}
@@ -224,32 +265,60 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 	resp.ResourceData = providerData
 }
 
+// insecureSkipVerifyWarning builds the diagnostic that is surfaced when the
+// caller sets insecure_skip_verify = true. The target base_url is named so an
+// operator scanning logs across multiple providers can identify which tenant
+// is affected.
+func insecureSkipVerifyWarning(baseURL string) (summary, detail string) {
+	summary = "TLS Certificate Verification Disabled"
+	detail = "The provider is configured with insecure_skip_verify = true. " +
+		"This disables TLS certificate verification, making connections susceptible to " +
+		"man-in-the-middle attacks. Only use this for development or testing " +
+		"with self-signed certificates.\n\n" +
+		"Target base_url: " + baseURL
+	return summary, detail
+}
+
+func validateBaseURL(raw string) (string, error) {
+	parsedBaseURL, err := url.Parse(raw)
+	if err != nil || parsedBaseURL == nil || parsedBaseURL.Scheme == "" || parsedBaseURL.Host == "" {
+		return "", fmt.Errorf("base_url must be a valid absolute URL including scheme and host, for example https://guardicore.example.com")
+	}
+
+	scheme := strings.ToLower(parsedBaseURL.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("base_url must use http or https")
+	}
+
+	return scheme, nil
+}
+
 func (p *GuardicoreProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		NewLabelResource,
-		NewLabelGroupResource,
-		NewPolicyRuleResource,
-		NewPolicyGroupResource,
-		NewDnsSecurityResource,
-		NewIncidentResource,
-		NewWorksiteResource,
-		NewUserGroupResource,
-		NewAssetResource,
+		label.NewLabelResource,
+		labelgroup.NewLabelGroupResource,
+		policyrule.NewPolicyRuleResource,
+		policygroup.NewPolicyGroupResource,
+		dnssecurity.NewDnsSecurityResource,
+		incident.NewIncidentResource,
+		worksite.NewWorksiteResource,
+		usergroup.NewUserGroupResource,
+		asset.NewAssetResource,
 	}
 }
 
 func (p *GuardicoreProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
-		NewLabelDataSource,
-		NewLabelGroupDataSource,
-		NewPolicyRuleDataSource,
-		NewPolicyGroupDataSource,
-		NewDnsSecurityDataSource,
-		NewIncidentDataSource,
-		NewWorksiteDataSource,
-		NewUserGroupDataSource,
-		NewAssetDataSource,
-		NewAgentAggregatorDataSource,
+		label.NewLabelDataSource,
+		labelgroup.NewLabelGroupDataSource,
+		policyrule.NewPolicyRuleDataSource,
+		policygroup.NewPolicyGroupDataSource,
+		dnssecurity.NewDnsSecurityDataSource,
+		incident.NewIncidentDataSource,
+		worksite.NewWorksiteDataSource,
+		usergroup.NewUserGroupDataSource,
+		asset.NewAssetDataSource,
+		agentaggregator.NewAgentAggregatorDataSource,
 	}
 }
 
@@ -263,7 +332,7 @@ func New(version string) func() provider.Provider {
 
 // getStringValue returns the value from the Terraform config, or falls back to environment variable.
 func getStringValue(tfValue types.String, envVar string) string {
-	if !tfValue.IsNull() && !tfValue.IsUnknown() {
+	if common.IsSet(tfValue) {
 		return tfValue.ValueString()
 	}
 	return os.Getenv(envVar)
@@ -271,7 +340,7 @@ func getStringValue(tfValue types.String, envVar string) string {
 
 // getBoolValue returns the value from the Terraform config, or falls back to environment variable.
 func getBoolValue(tfValue types.Bool, envVar string) bool {
-	if !tfValue.IsNull() && !tfValue.IsUnknown() {
+	if common.IsSetBool(tfValue) {
 		return tfValue.ValueBool()
 	}
 	if v := os.Getenv(envVar); v != "" {
@@ -285,7 +354,7 @@ func getBoolValue(tfValue types.Bool, envVar string) bool {
 // getInt64Value returns the value from the Terraform config, or falls back to environment variable.
 // Returns 0 if neither is set.
 func getInt64Value(tfValue types.Int64, envVar string) int64 {
-	if !tfValue.IsNull() && !tfValue.IsUnknown() {
+	if common.IsSetInt64(tfValue) {
 		return tfValue.ValueInt64()
 	}
 	if v := os.Getenv(envVar); v != "" {

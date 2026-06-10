@@ -6,6 +6,7 @@ linters:
     - depguard
     - durationcheck
     - errcheck
+    - errorlint
     - forcetypeassert
     - godot
     - ineffassign

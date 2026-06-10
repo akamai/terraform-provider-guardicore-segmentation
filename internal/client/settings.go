@@ -54,6 +54,7 @@ type RuntimeSettings struct {
 	RequestMaxRetries     int
 	RequestRetryBaseDelay time.Duration
 	RequestRetryMaxDelay  time.Duration
+	RetryJitter           bool
 	AuthMaxRetries        int
 	AuthRetryBaseDelay    time.Duration
 	MaxConcurrentRequests int
@@ -72,6 +73,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		RequestMaxRetries:     maxRequestRetries,
 		RequestRetryBaseDelay: retryBaseDelay,
 		RequestRetryMaxDelay:  retryMaxDelay,
+		RetryJitter:           true,
 		AuthMaxRetries:        authMaxRetries,
 		AuthRetryBaseDelay:    authRetryBaseDelay,
 		MaxConcurrentRequests: 0,
@@ -109,6 +111,7 @@ func ResolveRuntimeSettings(override *RuntimeSettings) RuntimeSettings {
 	if override.RequestRetryMaxDelay > 0 {
 		settings.RequestRetryMaxDelay = override.RequestRetryMaxDelay
 	}
+	settings.RetryJitter = override.RetryJitter
 	if override.AuthMaxRetries >= 0 {
 		settings.AuthMaxRetries = override.AuthMaxRetries
 	}
@@ -174,6 +177,7 @@ func isZeroRuntimeSettings(s RuntimeSettings) bool {
 		s.RequestMaxRetries == 0 &&
 		s.RequestRetryBaseDelay == 0 &&
 		s.RequestRetryMaxDelay == 0 &&
+		!s.RetryJitter &&
 		s.AuthMaxRetries == 0 &&
 		s.AuthRetryBaseDelay == 0 &&
 		s.MaxConcurrentRequests == 0 &&

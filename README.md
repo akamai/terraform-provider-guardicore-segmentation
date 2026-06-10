@@ -78,6 +78,7 @@ Then commit the changes to `go.mod` and `go.sum`.
 
 ```hcl
 provider "guardicore" {
+  # HTTPS is strongly recommended; HTTP is allowed but provider emits a warning
   base_url = "https://your-guardicore-instance.example.com"
 
   # Preferred for MFA-enabled accounts and automation
@@ -88,7 +89,9 @@ provider "guardicore" {
   # username      = var.guardicore_username
   # password      = var.guardicore_password
 
-  # Optional: skip TLS verification for self-signed certificates
+  # Optional: skip TLS verification for self-signed certificates.
+  # When true, the provider emits a warning naming the targeted base_url
+  # so operators scanning logs can identify which tenant has verification disabled.
   insecure_skip_verify = false
 
   # Optional: HTTP request timeout in seconds (default: 30)
@@ -201,6 +204,10 @@ go build -o .\bin\guardicore-importer.exe .\cmd\importer\
 | `--insecure` | | Skip TLS certificate verification |
 | `--request-timeout` | `GUARDICORE_REQUEST_TIMEOUT` | HTTP request timeout in seconds (default: 120) |
 | `--output-dir` | | Output directory (default: `.`) |
+| `--file-mode` | | Permission mode (octal) for generated `.tf` files (default: `0600`) |
+| `--dir-mode` | | Permission mode (octal) for the output directory (default: `0700`) |
+
+Generated files default to `0600` and the output directory to `0700` because the configuration can contain inventory metadata (asset names, labels, NIC MAC addresses) that some users treat as sensitive.
 
 ### Output
 
@@ -238,6 +245,8 @@ terraform plan  # Should show no changes if resources match
 - **Worksites**: Full CRUD operations (requires worksites feature to be enabled on Akamai Guardicore Segmentation instance)
 - **User Groups**: Full CRUD operations with nested orchestration groups (acceptance coverage requires AD orchestration setup)
 - **Assets**: Full CRUD operations with NICs, assignable labels, orchestration metadata, and worksite assignments (DELETE deactivates)
+- **Client Error Hygiene**: Client error-path response reads now preserve read-failure details instead of silently swallowing body read errors
+- **Retry Backoff Jitter**: Request retry backoff includes jitter by default to reduce synchronized retries during transient API failures
 - **Batching Runtime**: Bulk-capable resources use provider-side request coalescing to send true batched API calls rather than one-item bulk requests
 - **Policy Groups**: Full CRUD operations for label, FQDN, and IP address collections (requires policy groups feature enabled on Akamai Guardicore Segmentation instance)
 - **Data Sources**: All data sources for labels, label groups, policy rules, policy groups, DNS blocklists, incidents, worksites, user groups, assets, and agent aggregators
@@ -277,6 +286,9 @@ terraform plan  # Should show no changes if resources match
 If you wish to work on the provider, you'll first need [Go](http://www.golang.org) installed on your machine (see [Requirements](#requirements) above).
 
 To compile the provider, run `make build`. To build and install the provider binary to `$GOPATH/bin`, run `make install`.
+
+Testing convention: keep fast/unit tests in `*_test.go`, and acceptance tests in `*_acc_test.go` (`TestAcc...`, `TF_ACC=1`).
+`make test` enforces this convention before running Go tests.
 
 
 To generate or update documentation, run `make generate`.
