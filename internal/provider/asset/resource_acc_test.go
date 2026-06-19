@@ -415,6 +415,47 @@ func TestAccAssetResource_withLabels(t *testing.T) {
 	})
 }
 
+func TestAccAssetResource_withLabelsWithoutID(t *testing.T) {
+	// id is optional: a label specified with only key+value must work. After
+	// apply, the computed id is backfilled from the server response and matches
+	// the managed label's id.
+	name := acctest.TestAccRandomName("tf-acc-asset-noidlbl")
+	orchObjID := acctest.TestAccRandomName("orch-noidlbl")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { acctest.TestAccAssetPreCheck(t) },
+		ProtoV6ProviderFactories: acctest.TestAccProtoV6ProviderFactories,
+		CheckDestroy:             acctest.TestAccCheckResourceDestroyed("guardicore_asset"),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAssetResourceConfigWithLabelsNoID(name, orchObjID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("guardicore_asset.test", "id"),
+					resource.TestCheckResourceAttr("guardicore_asset.test", "labels.#", "1"),
+					resource.TestCheckTypeSetElemNestedAttrs("guardicore_asset.test", "labels.*", map[string]string{
+						"key":   fmt.Sprintf("tf-acc-asset-label-%s", orchObjID),
+						"value": "test-value",
+					}),
+					// The computed id is backfilled to the managed label's id.
+					resource.TestCheckTypeSetElemAttrPair(
+						"guardicore_asset.test", "labels.*.id",
+						"guardicore_label.test_asset_label", "id",
+					),
+				),
+			},
+			// Because labels is a Set with a Computed nested id and the config
+			// omits id, the id re-plans as "known after apply": re-planning the
+			// same config yields a non-empty plan. This is expected; pin the id
+			// (id = guardicore_label.<name>.id) if a stable plan is required.
+			{
+				Config:             testAccAssetResourceConfigWithLabelsNoID(name, orchObjID),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
 func TestAccAssetResource_withExplicitEmptyLabels(t *testing.T) {
 	name := acctest.TestAccRandomName("tf-acc-asset-emptylbl")
 	orchObjID := acctest.TestAccRandomName("orch-emptylbl")
@@ -511,6 +552,31 @@ resource "guardicore_asset" "test" {
   }]
 
   labels = []
+}
+`, name, orchObjID)
+}
+
+func testAccAssetResourceConfigWithLabelsNoID(name, orchObjID string) string {
+	return acctest.TestAccProviderConfig() + fmt.Sprintf(`
+resource "guardicore_label" "test_asset_label" {
+  key   = "tf-acc-asset-label-%[2]s"
+  value = "test-value"
+}
+
+resource "guardicore_asset" "test" {
+  name                 = %[1]q
+  orchestration_obj_id = %[2]q
+
+  nics = [{
+    ip_addresses = ["10.0.0.1"]
+    mac_address  = "00:11:22:33:44:55"
+  }]
+
+  # id is intentionally omitted; the API resolves the label by key+value.
+  labels = [{
+    key   = guardicore_label.test_asset_label.key
+    value = guardicore_label.test_asset_label.value
+  }]
 }
 `, name, orchObjID)
 }
