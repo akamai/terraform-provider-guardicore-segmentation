@@ -88,7 +88,7 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 			"~> **Labels Behavior:** The `labels` attribute manages only explicitly configured, assignable labels for this asset. " +
 			"Labels marked `read_only = true` and labels with dynamic criteria are not assignable and will be rejected during plan/apply validation. " +
 			"Omit `labels` to opt out of Terraform label management for an asset. Set `labels = []` to explicitly manage zero assignable labels.\n\n" +
-			"~> **Reference Validation:** Label IDs in the `labels` block and the `worksite_id` are validated for existence in Akamai Guardicore Segmentation during plan and apply. " +
+			"~> **Reference Validation:** Label IDs in the `labels` block (when set) and the `worksite_id` are validated for existence in Akamai Guardicore Segmentation during plan and apply. " +
 			"Non-existent IDs will produce a clear error before any API call is made.",
 
 		Attributes: map[string]schema.Attribute{
@@ -204,12 +204,13 @@ func (r *AssetResource) Schema(ctx context.Context, req resource.SchemaRequest, 
 			},
 			"labels": schema.SetNestedAttribute{
 				Optional:            true,
-				MarkdownDescription: "Set of Terraform-managed labels assigned to the asset. Each label requires `id`, `key`, and `value` — the API needs all three. Reference a managed label via `guardicore_label.<name>.id`, `.key`, and `.value`. Use the `guardicore_label` data source for labels not managed by Terraform. Labels marked `read_only = true` and labels with dynamic criteria are system-managed and cannot be assigned in `guardicore_asset.labels` (validation error). Omit this attribute to avoid Terraform label management for the asset; set `labels = []` to manage zero assignable labels.",
+				MarkdownDescription: "Set of Terraform-managed labels assigned to the asset. Each label requires `key` and `value`. The `id` is optional: the API ignores any supplied label `id` and resolves the label by `key`+`value`, so the provider computes `id` from the server response after apply. You may still set `id` (for example via `guardicore_label.<name>.id`) to make reference existence/assignability validation stricter. Use the `guardicore_label` data source for labels not managed by Terraform. Labels marked `read_only = true` and labels with dynamic criteria are system-managed and cannot be assigned in `guardicore_asset.labels` (validation error). Omit this attribute to avoid Terraform label management for the asset; set `labels = []` to manage zero assignable labels.",
 				NestedObject: schema.NestedAttributeObject{
 					Attributes: map[string]schema.Attribute{
 						"id": schema.StringAttribute{
-							Required:            true,
-							MarkdownDescription: "The label ID. Use `guardicore_label.<name>.id` to reference a managed label.",
+							Optional:            true,
+							Computed:            true,
+							MarkdownDescription: "The label ID. Optional because the API ignores any supplied label `id` and resolves the label by `key`+`value`. When omitted, it is computed from the server response and shown as \"known after apply\". Use `guardicore_label.<name>.id` to pin a specific label and enable stricter reference validation.",
 						},
 						"key": schema.StringAttribute{
 							Required:            true,
@@ -614,18 +615,20 @@ func (r *AssetResource) modelNicsToAPI(ctx context.Context, nics []NICModel, dia
 }
 
 // modelLabelsToAPI converts label models to API structs.
+// The label id is optional: the API ignores any supplied id and resolves the
+// label by key+value, so only key and value are required here. A known, non-empty
+// id is still forwarded (it is harmless and aids debugging).
 func (r *AssetResource) modelLabelsToAPI(ctx context.Context, labels []AssetLabelModel, diags *diag.Diagnostics) []client.AssetLabelRef {
 	if labels == nil {
 		return nil
 	}
 	apiLabels := make([]client.AssetLabelRef, 0, len(labels))
 	for i, l := range labels {
-		if l.ID.IsNull() || l.ID.IsUnknown() || l.ID.ValueString() == "" ||
-			l.Key.IsNull() || l.Key.IsUnknown() || l.Key.ValueString() == "" ||
+		if l.Key.IsNull() || l.Key.IsUnknown() || l.Key.ValueString() == "" ||
 			l.Value.IsNull() || l.Value.IsUnknown() || l.Value.ValueString() == "" {
 			diags.AddError(
 				"Invalid Asset Label Configuration",
-				fmt.Sprintf("labels[%d] must include non-empty id, key, and value.", i),
+				fmt.Sprintf("labels[%d] must include non-empty key and value.", i),
 			)
 			continue
 		}
@@ -633,18 +636,30 @@ func (r *AssetResource) modelLabelsToAPI(ctx context.Context, labels []AssetLabe
 		if r.isAssetIgnoredLabel(ctx, l, diags) {
 			diags.AddError(
 				"Invalid Asset Label Configuration",
-				fmt.Sprintf("Label %q in labels[%d] is read-only or dynamic and cannot be managed in guardicore_asset.labels. Remove it from configuration; server-managed labels are preserved automatically.", l.ID.ValueString(), i),
+				fmt.Sprintf("Label %q in labels[%d] is read-only or dynamic and cannot be managed in guardicore_asset.labels. Remove it from configuration; server-managed labels are preserved automatically.", assetLabelIdentifier(l), i),
 			)
 			continue
 		}
 
-		apiLabels = append(apiLabels, client.AssetLabelRef{
-			ID:    l.ID.ValueString(),
+		ref := client.AssetLabelRef{
 			Key:   l.Key.ValueString(),
 			Value: l.Value.ValueString(),
-		})
+		}
+		if common.IsSet(l.ID) && l.ID.ValueString() != "" {
+			ref.ID = l.ID.ValueString()
+		}
+		apiLabels = append(apiLabels, ref)
 	}
 	return apiLabels
+}
+
+// assetLabelIdentifier returns a human-readable identifier for a label model,
+// preferring the id when set and falling back to "key=value".
+func assetLabelIdentifier(l AssetLabelModel) string {
+	if common.IsSet(l.ID) && l.ID.ValueString() != "" {
+		return l.ID.ValueString()
+	}
+	return fmt.Sprintf("%s=%s", l.Key.ValueString(), l.Value.ValueString())
 }
 
 func (r *AssetResource) isAssetIgnoredLabel(ctx context.Context, label AssetLabelModel, diags *diag.Diagnostics) bool {
@@ -652,11 +667,25 @@ func (r *AssetResource) isAssetIgnoredLabel(ctx context.Context, label AssetLabe
 		return true
 	}
 
-	if label.ID.IsNull() || label.ID.IsUnknown() || label.ID.ValueString() == "" || r.referenceChecker == nil {
+	if r.referenceChecker == nil {
 		return false
 	}
 
-	labelID := label.ID.ValueString()
+	// Prefer the explicit id when set. Otherwise resolve the label by key+value,
+	// since the id is optional in configuration.
+	if common.IsSet(label.ID) && label.ID.ValueString() != "" {
+		return r.isAssetIgnoredLabelByID(ctx, label.ID.ValueString(), diags)
+	}
+
+	if common.IsSet(label.Key) && label.Key.ValueString() != "" &&
+		common.IsSet(label.Value) && label.Value.ValueString() != "" {
+		return r.isAssetIgnoredLabelByKeyValue(ctx, label.Key.ValueString(), label.Value.ValueString(), diags)
+	}
+
+	return false
+}
+
+func (r *AssetResource) isAssetIgnoredLabelByID(ctx context.Context, labelID string, diags *diag.Diagnostics) bool {
 	if r.ignoreCache != nil {
 		if ignored, ok := r.ignoreCache.Get(labelID); ok {
 			return ignored
@@ -703,6 +732,33 @@ func (r *AssetResource) isAssetIgnoredLabel(ctx context.Context, label AssetLabe
 	}
 
 	return ignored
+}
+
+// isAssetIgnoredLabelByKeyValue resolves whether a label identified only by
+// key+value (no id) is read-only or dynamic and therefore must not be managed
+// in guardicore_asset.labels.
+func (r *AssetResource) isAssetIgnoredLabelByKeyValue(ctx context.Context, key, value string, diags *diag.Diagnostics) bool {
+	labels, err := r.referenceChecker.ListLabels(ctx, key, value)
+	if err != nil {
+		diags.AddWarning(
+			"Unable to Determine Asset Label Ignore Status",
+			fmt.Sprintf("Unable to list labels while resolving read-only status for label %q=%q: %s", key, value, err),
+		)
+		return false
+	}
+
+	for _, candidate := range labels {
+		if candidate.Key != key || candidate.Value != value {
+			continue
+		}
+		ignored := (candidate.ReadOnly != nil && *candidate.ReadOnly) || len(candidate.DynamicCriteria) > 0
+		if candidate.ID != "" && r.ignoreCache != nil {
+			r.ignoreCache.Set(candidate.ID, ignored)
+		}
+		return ignored
+	}
+
+	return false
 }
 
 func assetLabelModelFromAPI(apiLabel client.AssetLabelRef, existing *AssetLabelModel) AssetLabelModel {
@@ -852,33 +908,47 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 	// but reflecting them would cause "inconsistent result after apply"
 	// errors because the plan didn't include them.
 	//
-	// The API list endpoint returns labels with only the ID populated
-	// (key and value are empty strings). We match by ID (primary) and
-	// fall back to key+value when the API does return those fields.
-	// The user's planned key+value are preserved in state since the API
-	// doesn't return them.
+	// GetAsset requests expand=labels, so the API returns labels with id, key,
+	// and value populated. Configured labels are matched to the API response by
+	// id when an id was supplied, otherwise by key+value (the id is optional and
+	// the API resolves labels by key+value). The resolved id is written back into
+	// state so the computed id attribute becomes known.
 	if data.Labels != nil {
-		// Build a set of label IDs confirmed by the API response.
-		apiByID := make(map[string]bool, len(asset.Labels))
-		for _, l := range asset.Labels {
-			apiByID[l.ID] = true
+		// Track which API labels have already been claimed so that multiple
+		// id-less configured labels are not all matched to the same API label.
+		consumed := make([]bool, len(asset.Labels))
+
+		matchByID := func(id string) int {
+			for i, l := range asset.Labels {
+				if !consumed[i] && l.ID == id {
+					return i
+				}
+			}
+			return -1
+		}
+		matchByKeyValue := func(key, value string) int {
+			for i, l := range asset.Labels {
+				if !consumed[i] && l.Key == key && l.Value == value {
+					return i
+				}
+			}
+			return -1
 		}
 
-		// Iterate over configured labels, keeping only labels confirmed by the API.
 		// labels is a set attribute, so ordering is intentionally not relied on.
 		filtered := make([]AssetLabelModel, 0, len(data.Labels))
 		for _, pl := range data.Labels {
-			id := pl.ID.ValueString()
-			if apiByID[id] {
-				apiLabel := client.AssetLabelRef{ID: id}
-				for _, l := range asset.Labels {
-					if l.ID == id {
-						apiLabel = l
-						break
-					}
-				}
-				filtered = append(filtered, assetLabelModelFromAPI(apiLabel, &pl))
+			idx := -1
+			if common.IsSet(pl.ID) && pl.ID.ValueString() != "" {
+				idx = matchByID(pl.ID.ValueString())
+			} else {
+				idx = matchByKeyValue(pl.Key.ValueString(), pl.Value.ValueString())
 			}
+			if idx < 0 {
+				continue
+			}
+			consumed[idx] = true
+			filtered = append(filtered, assetLabelModelFromAPI(asset.Labels[idx], &pl))
 		}
 		data.Labels = filtered
 	} else if len(asset.Labels) > 0 && isImport {
@@ -952,19 +1022,33 @@ func (r *AssetResource) apiToModel(ctx context.Context, asset *client.Asset, dat
 	}
 }
 
-// validateAssetLabelRefs validates that all label IDs referenced in asset labels
-// exist and are assignable (not read-only, not dynamic).
+// validateAssetLabelRefs validates that all labels referenced in asset labels
+// exist and are assignable (not read-only, not dynamic). Labels are validated
+// by id when an id is set, otherwise by key+value (the id is optional and the
+// API resolves labels by key+value).
 func validateAssetLabelRefs(ctx context.Context, checker common.ReferenceChecker, labels []AssetLabelModel) diag.Diagnostics {
 	var diags diag.Diagnostics
 	for i, labelModel := range labels {
 		labelID := labelModel.ID.ValueString()
-		if labelModel.ID.IsNull() || labelModel.ID.IsUnknown() || labelID == "" {
+		if common.IsSet(labelModel.ID) && labelID != "" {
+			location := fmt.Sprintf("labels[%d].id", i)
+			diags.Append(common.ValidateLabelExists(ctx, checker, labelID, location)...)
+			// Also check assignability
+			diags.Append(resolveAssetLabelAssignability(ctx, checker, labelID, location)...)
 			continue
 		}
-		location := fmt.Sprintf("labels[%d].id", i)
-		diags.Append(common.ValidateLabelExists(ctx, checker, labelID, location)...)
-		// Also check assignability
-		diags.Append(resolveAssetLabelAssignability(ctx, checker, labelID, location)...)
+
+		// No id supplied: validate by key+value when both are known.
+		if labelModel.Key.IsUnknown() || labelModel.Value.IsUnknown() {
+			continue
+		}
+		key := labelModel.Key.ValueString()
+		value := labelModel.Value.ValueString()
+		if key == "" || value == "" {
+			continue
+		}
+		location := fmt.Sprintf("labels[%d] (key=%q, value=%q)", i, key, value)
+		diags.Append(resolveAssetLabelAssignabilityByKeyValue(ctx, checker, key, value, location)...)
 	}
 	return diags
 }
@@ -977,13 +1061,43 @@ func resolveAssetLabelAssignability(ctx context.Context, checker common.Referenc
 	if err != nil || label == nil {
 		return diags // already reported by ValidateLabelExists
 	}
+	diags.Append(assetLabelAssignabilityDiags(*label, location)...)
+	return diags
+}
+
+// resolveAssetLabelAssignabilityByKeyValue checks that a label identified by
+// key+value (no id) is not read-only or dynamic. When no matching label exists
+// yet (for example it is created in the same apply), no error is raised.
+func resolveAssetLabelAssignabilityByKeyValue(ctx context.Context, checker common.ReferenceChecker, key, value, location string) diag.Diagnostics {
+	var diags diag.Diagnostics
+	labels, err := checker.ListLabels(ctx, key, value)
+	if err != nil {
+		diags.AddError(
+			"Reference Validation Error",
+			fmt.Sprintf("Unable to verify label referenced in %s: %s", location, err),
+		)
+		return diags
+	}
+	for _, label := range labels {
+		if label.Key == key && label.Value == value {
+			diags.Append(assetLabelAssignabilityDiags(label, location)...)
+			break
+		}
+	}
+	return diags
+}
+
+// assetLabelAssignabilityDiags returns errors when a label is read-only or
+// dynamic and therefore cannot be manually assigned to an asset.
+func assetLabelAssignabilityDiags(label client.Label, location string) diag.Diagnostics {
+	var diags diag.Diagnostics
 	if label.ReadOnly != nil && *label.ReadOnly {
 		diags.AddError("Read-Only Label Cannot Be Assigned",
-			fmt.Sprintf("Label %q referenced in %s is read-only and cannot be manually assigned to assets.", labelID, location))
+			fmt.Sprintf("Label referenced in %s is read-only and cannot be manually assigned to assets.", location))
 	}
 	if len(label.DynamicCriteria) > 0 {
 		diags.AddError("Dynamic Label Cannot Be Assigned",
-			fmt.Sprintf("Label %q referenced in %s has dynamic criteria and cannot be manually assigned to assets.", labelID, location))
+			fmt.Sprintf("Label referenced in %s has dynamic criteria and cannot be manually assigned to assets.", location))
 	}
 	return diags
 }
