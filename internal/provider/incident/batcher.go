@@ -31,6 +31,6 @@ func NewIncidentCreateBatcher(c *client.Client, tuning client.BatcherTuning) *co
 		ExecuteOne: func(ctx context.Context, item *client.IncidentCreate) (string, error) {
 			return c.CreateIncident(ctx, item)
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[*client.IncidentCreate],
 	})
 }
