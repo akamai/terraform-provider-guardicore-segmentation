@@ -23,9 +23,7 @@ func NewLabelGroupCreateBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return results, nil
 		},
-		Publish: func(ctx context.Context) error {
-			return c.PublishLabelGroups(ctx)
-		},
+		Publish: labelGroupPublish[*client.LabelGroupCreate](c),
 		WarnLog: labelGroupWarnLog,
 	})
 }
@@ -45,9 +43,7 @@ func NewLabelGroupUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return results, nil
 		},
-		Publish: func(ctx context.Context) error {
-			return c.PublishLabelGroups(ctx)
-		},
+		Publish: labelGroupPublish[common.LabelGroupUpdateReq](c),
 		WarnLog: labelGroupWarnLog,
 	})
 }
@@ -65,11 +61,17 @@ func NewLabelGroupDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return results, nil
 		},
-		Publish: func(ctx context.Context) error {
-			return c.PublishLabelGroups(ctx)
-		},
+		Publish: labelGroupPublish[string](c),
 		WarnLog: labelGroupWarnLog,
 	})
+}
+
+// labelGroupPublish publishes label group changes. Label groups have no
+// per-object publish scope, so the batch items are not inspected.
+func labelGroupPublish[Req any](c *client.Client) func(context.Context, []Req) error {
+	return func(ctx context.Context, _ []Req) error {
+		return c.PublishLabelGroups(ctx)
+	}
 }
 
 func labelGroupWarnLog(msg string) {

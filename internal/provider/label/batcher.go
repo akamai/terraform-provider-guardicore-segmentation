@@ -32,7 +32,7 @@ func NewLabelCreateBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 
 			return bulkResp.Succeeded, nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[*client.LabelCreate],
 	})
 }
 
@@ -48,7 +48,7 @@ func NewLabelUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 			}
 			return make([]struct{}, len(items)), nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[common.LabelUpdateReq],
 	})
 }
 
@@ -97,6 +97,6 @@ func NewLabelDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 			}
 			return struct{}{}, nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[string],
 	})
 }

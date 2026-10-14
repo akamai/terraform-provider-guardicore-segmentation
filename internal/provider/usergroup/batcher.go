@@ -24,7 +24,7 @@ func NewUserGroupCreateBatcher(c *client.Client, tuning client.BatcherTuning) *c
 			}
 			return results, nil
 		},
-		Publish:     userGroupPublish(c),
+		Publish:     userGroupPublish[*client.UserGroupCreate](c),
 		IsPublishOK: userGroupIsPublishOK,
 		WarnLog:     userGroupWarnLog,
 	})
@@ -43,7 +43,7 @@ func NewUserGroupUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *c
 			}
 			return results, nil
 		},
-		Publish:     userGroupPublish(c),
+		Publish:     userGroupPublish[common.UserGroupUpdateReq](c),
 		IsPublishOK: userGroupIsPublishOK,
 		WarnLog:     userGroupWarnLog,
 	})
@@ -62,14 +62,16 @@ func NewUserGroupDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *c
 			}
 			return results, nil
 		},
-		Publish:     userGroupPublish(c),
+		Publish:     userGroupPublish[string](c),
 		IsPublishOK: userGroupIsPublishOK,
 		WarnLog:     userGroupWarnLog,
 	})
 }
 
-func userGroupPublish(c *client.Client) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
+// userGroupPublish publishes user group changes. User group revisions have no
+// per-object publish scope, so the batch items are not inspected.
+func userGroupPublish[Req any](c *client.Client) func(context.Context, []Req) error {
+	return func(ctx context.Context, _ []Req) error {
 		return c.CreateUserGroupRevision(ctx, &client.UserGroupRevisionRequest{
 			Comments: "Published via Terraform",
 		})

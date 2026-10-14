@@ -466,7 +466,7 @@ func TestPolicyRuleCreateBatcher_FlushesAtBatchSize(t *testing.T) {
 			}
 			return bulkResp.Succeeded, nil
 		},
-		Publish:     policyRulePublish(apiClient),
+		Publish:     policyRulePublish(apiClient, rulesetFromSpec),
 		IsPublishOK: policyRuleIsPublishOK,
 		WarnLog:     policyRuleWarnLog,
 	})
@@ -570,7 +570,7 @@ func TestPolicyRuleCreateBatcher_ConcurrentFlushesSerialize(t *testing.T) {
 			}
 			return bulkResp.Succeeded, nil
 		},
-		Publish:     policyRulePublish(apiClient),
+		Publish:     policyRulePublish(apiClient, rulesetFromSpec),
 		IsPublishOK: policyRuleIsPublishOK,
 		WarnLog:     policyRuleWarnLog,
 	})
@@ -665,7 +665,7 @@ func TestPolicyRuleCreateBatcher_LargeBatchChunked(t *testing.T) {
 			}
 			return bulkResp.Succeeded, nil
 		},
-		Publish:     policyRulePublish(apiClient),
+		Publish:     policyRulePublish(apiClient, rulesetFromSpec),
 		IsPublishOK: policyRuleIsPublishOK,
 		WarnLog:     policyRuleWarnLog,
 	})
@@ -840,7 +840,7 @@ func TestPolicyRuleDeleteBatcher_CoalescesAndPublishesOnce(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := batcher.Enqueue(context.Background(), fmt.Sprintf("rule-%d", i))
+			_, err := batcher.Enqueue(context.Background(), common.PolicyRuleDeleteReq{ID: fmt.Sprintf("rule-%d", i)})
 			errCh <- err
 		}(i)
 	}
@@ -860,5 +860,201 @@ func TestPolicyRuleDeleteBatcher_CoalescesAndPublishesOnce(t *testing.T) {
 	}
 	if publishCalls != 1 {
 		t.Fatalf("expected 1 publish call, got %d", publishCalls)
+	}
+}
+
+func TestCollectRulesets(t *testing.T) {
+	identity := func(s string) string { return s }
+
+	tests := []struct {
+		name  string
+		items []string
+		want  []string
+	}{
+		{
+			name:  "deduplicates and sorts",
+			items: []string{"web-app", "database", "web-app"},
+			want:  []string{"database", "web-app"},
+		},
+		{
+			name:  "maps rules with no ruleset to the undefined sentinel",
+			items: []string{"web-app", ""},
+			want:  []string{"undefined", "web-app"},
+		},
+		{
+			name:  "empty batch yields empty scope",
+			items: nil,
+			want:  []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectRulesets(tt.items, identity)
+			if len(got) != len(tt.want) {
+				t.Fatalf("expected %v, got %v", tt.want, got)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("expected %v, got %v", tt.want, got)
+				}
+			}
+		})
+	}
+}
+
+// capturePublishedRulesets runs a batcher against a stub API and returns the
+// "rulesets" field of the publish request, which is what scopes the revision.
+func capturePublishedRulesets(t *testing.T, bulkPath string, enqueue func(*client.Client)) []string {
+	t.Helper()
+
+	var mu sync.Mutex
+	var published []string
+	publishCalls := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case bulkPath:
+			var body any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("failed to decode bulk request: %v", err)
+			}
+			specs, _ := body.([]any)
+			succeeded := make([]string, len(specs))
+			for i := range specs {
+				succeeded[i] = fmt.Sprintf("rule-%d", i+1)
+			}
+			writeBatcherJSON(t, w, client.PolicyRulesBulkCreateResponse{
+				NumberOfSucceeded: len(specs),
+				Result:            "success",
+				Succeeded:         succeeded,
+				TotalNumber:       len(specs),
+			})
+		case "/api/v4.0/visibility/policy/revisions":
+			var req client.PolicyRevisionRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("failed to decode publish request: %v", err)
+			}
+			mu.Lock()
+			published = req.Rulesets
+			publishCalls++
+			mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	apiClient, err := client.NewClient(client.Config{BaseURL: server.URL, AccessToken: "test-token"})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	enqueue(apiClient)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if publishCalls != 1 {
+		t.Fatalf("expected 1 publish call, got %d", publishCalls)
+	}
+	return published
+}
+
+func assertRulesets(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("expected rulesets %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected rulesets %v, got %v", want, got)
+		}
+	}
+}
+
+// An unscoped publish (empty rulesets) tells the API to publish every pending
+// change, including unrelated drafts made outside Terraform. The create path
+// must scope the revision to the rulesets its own batch touched.
+func TestPolicyRuleCreateBatcher_PublishScopedToTouchedRulesets(t *testing.T) {
+	specs := []map[string]any{
+		{"action": "ALLOW", "section_position": "ALLOW", "source": map[string]any{}, "destination": map[string]any{}, "ruleset_name": "web-app"},
+		{"action": "ALLOW", "section_position": "ALLOW", "source": map[string]any{}, "destination": map[string]any{}, "ruleset_name": "database"},
+		{"action": "ALLOW", "section_position": "ALLOW", "source": map[string]any{}, "destination": map[string]any{}, "ruleset_name": "web-app"},
+		{"action": "ALLOW", "section_position": "ALLOW", "source": map[string]any{}, "destination": map[string]any{}},
+	}
+
+	got := capturePublishedRulesets(t, "/api/v4.0/visibility/policy/rules/bulk", func(apiClient *client.Client) {
+		batcher := NewPolicyRuleCreateBatcher(apiClient, client.BatcherTuning{})
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(specs))
+		for _, spec := range specs {
+			wg.Add(1)
+			go func(spec map[string]any) {
+				defer wg.Done()
+				if _, err := batcher.Enqueue(context.Background(), spec); err != nil {
+					errCh <- err
+				}
+			}(spec)
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Errorf("unexpected enqueue error: %v", err)
+		}
+	})
+
+	assertRulesets(t, got, []string{"database", "undefined", "web-app"})
+}
+
+// Deletes carry the ruleset name from prior Terraform state, because the rule
+// is gone from the API by the time the batch publishes.
+func TestPolicyRuleDeleteBatcher_PublishScopedToRulesetFromState(t *testing.T) {
+	reqs := []common.PolicyRuleDeleteReq{
+		{ID: "rule-1", RulesetName: "web-app"},
+		{ID: "rule-2", RulesetName: "web-app"},
+		{ID: "rule-3"},
+	}
+
+	got := capturePublishedRulesets(t, "/api/v4.0/visibility/policy/rules/delete/bulk", func(apiClient *client.Client) {
+		batcher := NewPolicyRuleDeleteBatcher(apiClient, client.BatcherTuning{})
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(reqs))
+		for _, req := range reqs {
+			wg.Add(1)
+			go func(req common.PolicyRuleDeleteReq) {
+				defer wg.Done()
+				if _, err := batcher.Enqueue(context.Background(), req); err != nil {
+					errCh <- err
+				}
+			}(req)
+		}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			t.Errorf("unexpected enqueue error: %v", err)
+		}
+	})
+
+	assertRulesets(t, got, []string{"undefined", "web-app"})
+}
+
+func TestIncludesUnassigned(t *testing.T) {
+	tests := []struct {
+		name     string
+		rulesets []string
+		want     bool
+	}{
+		{name: "named rulesets only", rulesets: []string{"database", "web-app"}, want: false},
+		{name: "unassigned bucket present", rulesets: []string{"undefined", "web-app"}, want: true},
+		{name: "empty scope", rulesets: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := includesUnassigned(tt.rulesets); got != tt.want {
+				t.Fatalf("expected %v, got %v", tt.want, got)
+			}
+		})
 	}
 }

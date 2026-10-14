@@ -19,6 +19,15 @@ type PolicyRuleUpdateReq struct {
 	Spec map[string]any
 }
 
+// PolicyRuleDeleteReq is the request type for batched policy rule deletes.
+// It carries RulesetName alongside the ID because the rule is gone from the
+// API by the time the batch publishes, and the publish must be scoped to the
+// rulesets it touched. The name comes from prior Terraform state.
+type PolicyRuleDeleteReq struct {
+	ID          string
+	RulesetName string
+}
+
 // LabelGroupUpdateReq is the request type for batched label group updates.
 type LabelGroupUpdateReq struct {
 	ID         string
@@ -51,7 +60,7 @@ type ProviderData struct {
 
 	PolicyRuleCreateBatcher *Batcher[map[string]any, string]
 	PolicyRuleUpdateBatcher *Batcher[PolicyRuleUpdateReq, struct{}]
-	PolicyRuleDeleteBatcher *Batcher[string, struct{}]
+	PolicyRuleDeleteBatcher *Batcher[PolicyRuleDeleteReq, struct{}]
 
 	LabelGroupCreateBatcher *Batcher[*client.LabelGroupCreate, *client.LabelGroupCreate]
 	LabelGroupUpdateBatcher *Batcher[LabelGroupUpdateReq, *client.LabelGroupCreate]

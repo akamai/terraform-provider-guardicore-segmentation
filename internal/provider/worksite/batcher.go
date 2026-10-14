@@ -17,6 +17,6 @@ func NewWorksiteDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *co
 			}
 			return make([]struct{}, len(items)), nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[string],
 	})
 }
