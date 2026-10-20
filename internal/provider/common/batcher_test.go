@@ -28,7 +28,7 @@ func TestBatcher_CoalescesAndPublishesOnce(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			publishCalls.Add(1)
 			return nil
 		},
@@ -78,7 +78,7 @@ func TestBatcher_BatchExecuteFailure(t *testing.T) {
 		ExecuteBatch: func(_ context.Context, _ []string) ([]string, error) {
 			return nil, batchErr
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			publishCalls.Add(1)
 			return nil
 		},
@@ -117,7 +117,7 @@ func TestBatcher_PublishFailure(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			return errors.New("publish failed")
 		},
 	})
@@ -152,7 +152,7 @@ func TestBatcher_FallbackToSingleExecution(t *testing.T) {
 			executeBatchCalls.Add(1)
 			return nil, errors.New("unknown field in batch")
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 		ShouldFallback: func(err error) bool {
 			return err.Error() == "unknown field in batch"
 		},
@@ -194,7 +194,7 @@ func TestBatcher_FallbackExecuteOneFailure(t *testing.T) {
 		ExecuteBatch: func(_ context.Context, _ []string) ([]string, error) {
 			return nil, errors.New("batch error")
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 		ShouldFallback: func(_ error) bool {
 			return true
 		},
@@ -221,7 +221,7 @@ func TestBatcher_IsPublishOKWithWarning(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			return errors.New("no changes to publish")
 		},
 		IsPublishOK: func(err error) bool {
@@ -263,7 +263,7 @@ func TestBatcher_FlushesAtBatchSize(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			publishCalls.Add(1)
 			return nil
 		},
@@ -318,7 +318,7 @@ func TestBatcher_ConcurrentFlushesSerialize(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			cur := currentConcurrent.Add(1)
 			for {
 				prev := maxConcurrent.Load()
@@ -379,7 +379,7 @@ func TestBatcher_LargeBatchChunked(t *testing.T) {
 			}
 			return results, nil
 		},
-		Publish: func(_ context.Context) error {
+		Publish: func(_ context.Context, _ []string) error {
 			mu.Lock()
 			publishCalls++
 			mu.Unlock()
@@ -428,7 +428,7 @@ func TestBatcher_VoidResultType(t *testing.T) {
 			executeCalls.Add(1)
 			return make([]struct{}, len(items)), nil
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 	})
 
 	const n = 3
@@ -460,7 +460,7 @@ func TestBatcher_ResultLengthMismatch(t *testing.T) {
 		ExecuteBatch: func(_ context.Context, _ []string) ([]string, error) {
 			return []string{"only-one"}, nil
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 	})
 
 	const n = 2
@@ -489,7 +489,7 @@ func TestBatcher_NoFallbackWhenNil(t *testing.T) {
 		ExecuteBatch: func(_ context.Context, _ []string) ([]string, error) {
 			return nil, errors.New("batch error")
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 	})
 
 	_, err := batcher.Enqueue(context.Background(), "item")
@@ -525,7 +525,7 @@ func TestBatcher_IndexedBatchErrorRouting(t *testing.T) {
 			}
 			return nil, &testIndexedError{perIndex: errs}
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 	})
 
 	const n = 3
@@ -582,7 +582,7 @@ func TestBatcher_IndexedBatchErrorSkipsFallback(t *testing.T) {
 		ExecuteBatch: func(_ context.Context, _ []string) ([]string, error) {
 			return nil, &testIndexedError{perIndex: map[int]error{0: errors.New("fail")}}
 		},
-		Publish:        func(_ context.Context) error { return nil },
+		Publish:        func(_ context.Context, _ []string) error { return nil },
 		ShouldFallback: func(_ error) bool { return true },
 		ExecuteOne: func(_ context.Context, _ string) (string, error) {
 			executeOneCalls.Add(1)
@@ -611,7 +611,7 @@ func TestBatcher_PropagatesContextToExecuteAndPublish(t *testing.T) {
 			}
 			return []string{"id-" + items[0]}, nil
 		},
-		Publish: func(ctx context.Context) error {
+		Publish: func(ctx context.Context, _ []string) error {
 			if got := ctx.Value(key); got != value {
 				return fmt.Errorf("publish missing propagated context value: got %v", got)
 			}
@@ -647,7 +647,7 @@ func TestBatcher_FallbackUsesPropagatedContext(t *testing.T) {
 			}
 			return "id-" + item, nil
 		},
-		Publish: func(_ context.Context) error { return nil },
+		Publish: func(_ context.Context, _ []string) error { return nil },
 	})
 
 	ctx := context.WithValue(context.Background(), key, value)
