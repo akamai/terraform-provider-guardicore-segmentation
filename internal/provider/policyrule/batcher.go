@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/akamai/terraform-provider-guardicore-segmentation/internal/client"
@@ -30,7 +31,7 @@ func NewPolicyRuleCreateBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return bulkResp.Succeeded, nil
 		},
-		Publish:        policyRulePublish(c),
+		Publish:        policyRulePublish(c, rulesetFromSpec),
 		ShouldFallback: policyRuleShouldFallback,
 		ExecuteOne: func(ctx context.Context, item map[string]any) (string, error) {
 			return c.CreatePolicyRule(ctx, item)
@@ -59,7 +60,9 @@ func NewPolicyRuleUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return make([]struct{}, len(items)), nil
 		},
-		Publish:        policyRulePublish(c),
+		Publish: policyRulePublish(c, func(item common.PolicyRuleUpdateReq) string {
+			return rulesetFromSpec(item.Spec)
+		}),
 		ShouldFallback: policyRuleAlwaysFallback,
 		ExecuteOne: func(ctx context.Context, item common.PolicyRuleUpdateReq) (struct{}, error) {
 			return struct{}{}, c.UpdatePolicyRule(ctx, item.ID, item.Spec)
@@ -69,14 +72,14 @@ func NewPolicyRuleUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *
 	})
 }
 
-func NewPolicyRuleDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *common.Batcher[string, struct{}] {
-	return common.NewBatcher(common.BatcherConfig[string, struct{}]{
+func NewPolicyRuleDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *common.Batcher[common.PolicyRuleDeleteReq, struct{}] {
+	return common.NewBatcher(common.BatcherConfig[common.PolicyRuleDeleteReq, struct{}]{
 		BatchSize:  tuning.BatchSize,
 		FlushDelay: tuning.FlushDelay,
-		ExecuteBatch: func(ctx context.Context, items []string) ([]struct{}, error) {
+		ExecuteBatch: func(ctx context.Context, items []common.PolicyRuleDeleteReq) ([]struct{}, error) {
 			bulkItems := make([]client.PolicyRuleBulkDeleteItem, len(items))
-			for i, id := range items {
-				bulkItems[i] = client.PolicyRuleBulkDeleteItem{ID: id}
+			for i, item := range items {
+				bulkItems[i] = client.PolicyRuleBulkDeleteItem{ID: item.ID}
 			}
 			bulkResp, err := c.BulkDeletePolicyRules(ctx, bulkItems)
 			if err != nil {
@@ -88,25 +91,101 @@ func NewPolicyRuleDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *
 			}
 			return make([]struct{}, len(items)), nil
 		},
-		Publish:        policyRulePublish(c),
+		Publish: policyRulePublish(c, func(item common.PolicyRuleDeleteReq) string {
+			return item.RulesetName
+		}),
 		IsPublishOK:    policyRuleIsPublishOK,
 		WarnLog:        policyRuleWarnLog,
 		ShouldFallback: policyRuleAlwaysFallback,
-		ExecuteOne: func(ctx context.Context, id string) (struct{}, error) {
-			return struct{}{}, c.DeletePolicyRule(ctx, id)
+		ExecuteOne: func(ctx context.Context, item common.PolicyRuleDeleteReq) (struct{}, error) {
+			return struct{}{}, c.DeletePolicyRule(ctx, item.ID)
 		},
 	})
 }
 
-func policyRulePublish(c *client.Client) func(ctx context.Context) error {
-	return func(ctx context.Context) error {
+// undefinedRuleset is the sentinel the API uses for rules that belong to no
+// ruleset (NO_RULESETS_ID server-side). Sending it scopes the revision to
+// exactly those rules, rather than leaving the scope empty.
+const undefinedRuleset = "undefined"
+
+// policyRulePublish publishes a revision scoped to the rulesets the batch
+// touched, derived from the batch items via rulesetOf.
+//
+// An unscoped revision (no ruleset_name and no rulesets) means "publish every
+// pending change" to the API, which would push unrelated drafts — including
+// ones made in the UI by other users — live without review. Scoping the
+// request keeps the revision limited to the rules Terraform actually manages.
+func policyRulePublish[Req any](c *client.Client, rulesetOf func(Req) string) func(context.Context, []Req) error {
+	return func(ctx context.Context, items []Req) error {
+		rulesets := collectRulesets(items, rulesetOf)
+		if len(rulesets) == 0 {
+			// Only reachable for an empty batch. Publishing unscoped here
+			// would publish everything pending, so do nothing instead.
+			policyRuleWarnLog("no rulesets derived from batch; skipping publish")
+			return nil
+		}
+
+		if includesUnassigned(rulesets) {
+			// ruleset_name is optional on the resource, so a managed rule can
+			// land in the unassigned bucket. The API expands that sentinel to
+			// every pending rule with no ruleset, which in most deployments is
+			// where ad-hoc rules created outside Terraform collect.
+			tflog.Warn(ctx, "policy revision scope includes rules with no ruleset_name. "+
+				"This publishes every pending unassigned rule, including any created outside Terraform. "+
+				"Set ruleset_name on all Terraform-managed policy rules to keep the scope narrow.",
+				map[string]any{"rulesets": rulesets})
+		}
+
 		revisionOrigin := "API_CALL"
 		return c.CreatePolicyRevision(ctx, &client.PolicyRevisionRequest{
 			Comments: "Published via Terraform",
-			Rulesets: []string{},
+			Rulesets: rulesets,
 			Origin:   &revisionOrigin,
 		})
 	}
+}
+
+// includesUnassigned reports whether the publish scope covers rules with no
+// ruleset. That bucket is shared with every other unassigned rule in the
+// system, so it is materially wider than a named ruleset.
+func includesUnassigned(rulesets []string) bool {
+	for _, name := range rulesets {
+		if name == undefinedRuleset {
+			return true
+		}
+	}
+	return false
+}
+
+// collectRulesets returns the deduplicated, sorted set of ruleset names the
+// batch touched. Rules with no ruleset map to undefinedRuleset, so a non-empty
+// batch always yields a non-empty scope. The result is sorted to keep requests
+// deterministic for logging and tests.
+func collectRulesets[Req any](items []Req, rulesetOf func(Req) string) []string {
+	seen := make(map[string]struct{}, len(items))
+	rulesets := make([]string, 0, len(items))
+
+	for _, item := range items {
+		name := rulesetOf(item)
+		if name == "" {
+			name = undefinedRuleset
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		rulesets = append(rulesets, name)
+	}
+
+	sort.Strings(rulesets)
+	return rulesets
+}
+
+// rulesetFromSpec reads the ruleset name out of a policy rule request body,
+// tolerating both an absent key and a non-string value.
+func rulesetFromSpec(spec map[string]any) string {
+	name, _ := spec["ruleset_name"].(string)
+	return name
 }
 
 func policyRuleShouldFallback(err error) bool {

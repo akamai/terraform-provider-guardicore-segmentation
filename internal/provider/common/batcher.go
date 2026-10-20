@@ -40,8 +40,11 @@ type BatcherConfig[Req, Res any] struct {
 	// items in the batch fail (unless ShouldFallback triggers individual retry).
 	ExecuteBatch func(ctx context.Context, items []Req) ([]Res, error)
 
-	// Publish is called once after a successful batch execution.
-	Publish func(ctx context.Context) error
+	// Publish is called once after a successful batch execution, receiving the
+	// items that were just written. Implementations that scope the publish to
+	// the affected objects (e.g. policy rules, which publish per ruleset) derive
+	// that scope from items; implementations with nothing to publish ignore it.
+	Publish func(ctx context.Context, items []Req) error
 
 	// ShouldFallback inspects an ExecuteBatch error and returns true if
 	// the batcher should retry items individually via ExecuteOne.
@@ -58,6 +61,10 @@ type BatcherConfig[Req, Res any] struct {
 	// accepts, so the condition is logged rather than silently swallowed.
 	WarnLog func(msg string)
 }
+
+// NoPublish is a Publish hook for batchers whose resources need no publish
+// step. It exists so those call sites do not each restate the item type.
+func NoPublish[Req any](_ context.Context, _ []Req) error { return nil }
 
 // Batcher coalesces concurrent requests and executes them in batches,
 // calling Publish once per batch instead of once per request.
@@ -189,7 +196,7 @@ func (b *Batcher[Req, Res]) flush() {
 		return
 	}
 
-	if err := b.config.Publish(execCtx); err != nil {
+	if err := b.config.Publish(execCtx, items); err != nil {
 		if b.config.IsPublishOK != nil && b.config.IsPublishOK(err) {
 			if b.config.WarnLog != nil {
 				b.config.WarnLog(err.Error())

@@ -31,7 +31,7 @@ func NewDnsSecurityCreateBatcher(c *client.Client, tuning client.BatcherTuning) 
 		ExecuteOne: func(ctx context.Context, item *client.DnsBlocklistCreate) (string, error) {
 			return c.CreateDnsBlocklist(ctx, item)
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[*client.DnsBlocklistCreate],
 	})
 }
 
@@ -59,7 +59,7 @@ func NewDnsSecurityUpdateBatcher(c *client.Client, tuning client.BatcherTuning) 
 		ExecuteOne: func(ctx context.Context, item common.DnsSecurityUpdateReq) (struct{}, error) {
 			return struct{}{}, c.UpdateDnsBlocklist(ctx, item.ID, item.Edit)
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[common.DnsSecurityUpdateReq],
 	})
 }
 
@@ -77,6 +77,6 @@ func NewDnsSecurityDeleteBatcher(c *client.Client, tuning client.BatcherTuning) 
 		ExecuteOne: func(ctx context.Context, item string) (struct{}, error) {
 			return struct{}{}, c.DeleteDnsBlocklist(ctx, item)
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[string],
 	})
 }

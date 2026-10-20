@@ -40,7 +40,7 @@ func NewAssetCreateBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 			}
 			return ids, nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[*client.AssetCreate],
 	})
 }
 
@@ -68,7 +68,7 @@ func NewAssetUpdateBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 
 			return make([]struct{}, len(items)), nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[*client.AssetBulkUpdateItem],
 	})
 }
 
@@ -82,6 +82,6 @@ func NewAssetDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *commo
 			}
 			return make([]struct{}, len(items)), nil
 		},
-		Publish: func(ctx context.Context) error { return nil },
+		Publish: common.NoPublish[string],
 	})
 }

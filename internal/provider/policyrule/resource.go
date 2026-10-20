@@ -34,7 +34,7 @@ type PolicyRuleResource struct {
 	client        *client.Client
 	createBatcher *common.Batcher[map[string]any, string]
 	updateBatcher *common.Batcher[common.PolicyRuleUpdateReq, struct{}]
-	deleteBatcher *common.Batcher[string, struct{}]
+	deleteBatcher *common.Batcher[common.PolicyRuleDeleteReq, struct{}]
 }
 
 // PolicyRuleResourceModel describes the resource data model.
@@ -358,7 +358,14 @@ func (r *PolicyRuleResource) Delete(ctx context.Context, req resource.DeleteRequ
 		return
 	}
 
-	if _, err := r.deleteBatcher.Enqueue(ctx, data.ID.ValueString()); err != nil {
+	// RulesetName comes from prior state: the rule is gone from the API by the
+	// time the batch publishes, so the publish scope cannot be read back.
+	deleteReq := common.PolicyRuleDeleteReq{
+		ID:          data.ID.ValueString(),
+		RulesetName: data.RulesetName.ValueString(),
+	}
+
+	if _, err := r.deleteBatcher.Enqueue(ctx, deleteReq); err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete policy rule, got error: %s", err))
 		return
 	}
