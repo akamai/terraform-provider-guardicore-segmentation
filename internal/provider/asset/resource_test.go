@@ -432,6 +432,74 @@ func TestModelLabelsToAPI_InvalidIncompleteLabelFields(t *testing.T) {
 	}
 }
 
+func TestModelLabelsToAPI_OptionalIDOmitted(t *testing.T) {
+	// id is optional: a label with only key+value (id null) is valid and the
+	// payload omits the id (the API resolves the label by key+value).
+	r := &AssetResource{}
+	labels := []AssetLabelModel{
+		{ID: types.StringNull(), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+		{ID: types.StringUnknown(), Key: types.StringValue("role"), Value: types.StringValue("web")},
+	}
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected diagnostics: %v", diags)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 labels, got %d", len(result))
+	}
+	for i, ref := range result {
+		if ref.ID != "" {
+			t.Errorf("labels[%d]: expected empty id when omitted, got %q", i, ref.ID)
+		}
+	}
+	if result[0].Key != "env" || result[0].Value != "prod" {
+		t.Errorf("unexpected first label: %+v", result[0])
+	}
+	if result[1].Key != "role" || result[1].Value != "web" {
+		t.Errorf("unexpected second label: %+v", result[1])
+	}
+}
+
+func TestModelLabelsToAPI_MissingKeyValueWithoutID(t *testing.T) {
+	// Without an id, key and value are still required.
+	r := &AssetResource{}
+	labels := []AssetLabelModel{
+		{ID: types.StringNull(), Key: types.StringValue("env"), Value: types.StringValue("")},
+	}
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for missing value")
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected no labels in payload, got %d", len(result))
+	}
+}
+
+func TestModelLabelsToAPI_FiltersReadOnlyByKeyValue(t *testing.T) {
+	// A read-only label referenced without an id must be rejected, resolved via
+	// key+value through ListLabels.
+	r := &AssetResource{
+		referenceChecker: &mockReferenceChecker{
+			listLabels: []client.Label{
+				{ID: "ro-1", Key: "cloud_provider", Value: "AWS", ReadOnly: boolPtrAsset(true)},
+			},
+		},
+	}
+	labels := []AssetLabelModel{
+		{ID: types.StringNull(), Key: types.StringValue("cloud_provider"), Value: types.StringValue("AWS")},
+	}
+	var diags diag.Diagnostics
+	result := r.modelLabelsToAPI(context.Background(), labels, &diags)
+	if !diags.HasError() {
+		t.Fatalf("expected diagnostics for read-only label resolved by key+value")
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected no labels in payload, got %d", len(result))
+	}
+}
+
 func boolPtrAsset(v bool) *bool {
 	return &v
 }
@@ -701,6 +769,77 @@ func TestApiToModel_UserLabelsKept(t *testing.T) {
 	}
 	if data.Labels[0].Value.ValueString() != "prod" {
 		t.Errorf("expected label value 'prod' (preserved from plan), got %q", data.Labels[0].Value.ValueString())
+	}
+}
+
+func TestApiToModel_UserLabelsMatchedByKeyValueWithoutID(t *testing.T) {
+	// id is optional: when a configured label omits id (unknown in plan), the
+	// read-back matches it to the API label by key+value and writes back the
+	// resolved id so the computed attribute becomes known.
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Labels: []AssetLabelModel{
+			{ID: types.StringUnknown(), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+		},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "lbl-1", Key: "env", Value: "prod"},
+			{ID: "auto-1", Key: "Agent", Value: "Not Installed"},
+		},
+	}
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if len(data.Labels) != 1 {
+		t.Fatalf("expected 1 label (matched by key+value), got %d", len(data.Labels))
+	}
+	if got := data.Labels[0].ID.ValueString(); got != "lbl-1" {
+		t.Errorf("expected resolved id 'lbl-1', got %q", got)
+	}
+	if data.Labels[0].Key.ValueString() != "env" || data.Labels[0].Value.ValueString() != "prod" {
+		t.Errorf("unexpected key/value: %+v", data.Labels[0])
+	}
+}
+
+func TestApiToModel_UserLabelsWithoutIDDistinctMatches(t *testing.T) {
+	// Two distinct id-less labels must each match a distinct API label and not
+	// collapse onto the same one.
+	r := &AssetResource{}
+	data := &AssetResourceModel{
+		Labels: []AssetLabelModel{
+			{ID: types.StringUnknown(), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+			{ID: types.StringUnknown(), Key: types.StringValue("role"), Value: types.StringValue("web")},
+		},
+	}
+	asset := &client.Asset{
+		ID:     "asset-1",
+		Name:   "test",
+		Status: "on",
+		Labels: []client.AssetLabelRef{
+			{ID: "lbl-role", Key: "role", Value: "web"},
+			{ID: "lbl-env", Key: "env", Value: "prod"},
+		},
+	}
+	var diags diag.Diagnostics
+	r.apiToModel(context.Background(), asset, data, &diags)
+	if diags.HasError() {
+		t.Fatalf("unexpected errors: %s", diags)
+	}
+	if len(data.Labels) != 2 {
+		t.Fatalf("expected 2 labels, got %d", len(data.Labels))
+	}
+	// Plan order preserved: env first, role second.
+	if data.Labels[0].ID.ValueString() != "lbl-env" {
+		t.Errorf("labels[0]: expected 'lbl-env', got %q", data.Labels[0].ID.ValueString())
+	}
+	if data.Labels[1].ID.ValueString() != "lbl-role" {
+		t.Errorf("labels[1]: expected 'lbl-role', got %q", data.Labels[1].ID.ValueString())
 	}
 }
 
@@ -1094,5 +1233,65 @@ func TestApiToModel_AllNicsValidNoWarnings(t *testing.T) {
 	}
 	if warningCount != 0 {
 		t.Errorf("expected no warnings for valid NICs, got %d", warningCount)
+	}
+}
+
+func TestValidateAssetLabelRefs_KeyValueReadOnlyRejected(t *testing.T) {
+	// A label referenced without an id but pointing at a read-only label
+	// (resolved by key+value) must be rejected at validation time.
+	checker := &mockReferenceChecker{
+		listLabels: []client.Label{
+			{ID: "ro-1", Key: "cloud_provider", Value: "AWS", ReadOnly: boolPtrAsset(true)},
+		},
+	}
+	labels := []AssetLabelModel{
+		{ID: types.StringNull(), Key: types.StringValue("cloud_provider"), Value: types.StringValue("AWS")},
+	}
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if !diags.HasError() {
+		t.Fatalf("expected error for read-only label resolved by key+value")
+	}
+}
+
+func TestValidateAssetLabelRefs_KeyValueAssignableAllowed(t *testing.T) {
+	// A label referenced without an id pointing at an assignable label is fine.
+	checker := &mockReferenceChecker{
+		listLabels: []client.Label{
+			{ID: "ok-1", Key: "env", Value: "prod"},
+		},
+	}
+	labels := []AssetLabelModel{
+		{ID: types.StringNull(), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+	}
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if diags.HasError() {
+		t.Fatalf("unexpected error for assignable label: %s", diags)
+	}
+}
+
+func TestValidateAssetLabelRefs_KeyValueUnknownSkipped(t *testing.T) {
+	// When key or value is unknown (e.g. references a not-yet-created label),
+	// validation is skipped rather than erroring.
+	checker := &mockReferenceChecker{}
+	labels := []AssetLabelModel{
+		{ID: types.StringUnknown(), Key: types.StringUnknown(), Value: types.StringValue("prod")},
+	}
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if diags.HasError() {
+		t.Fatalf("unexpected error when key is unknown: %s", diags)
+	}
+}
+
+func TestValidateAssetLabelRefs_IDStillValidated(t *testing.T) {
+	// When an id is supplied, existence is still validated by id.
+	checker := &mockReferenceChecker{
+		labels: map[string]*client.Label{},
+	}
+	labels := []AssetLabelModel{
+		{ID: types.StringValue("does-not-exist"), Key: types.StringValue("env"), Value: types.StringValue("prod")},
+	}
+	diags := validateAssetLabelRefs(context.Background(), checker, labels)
+	if !diags.HasError() {
+		t.Fatalf("expected error for non-existent label id")
 	}
 }
