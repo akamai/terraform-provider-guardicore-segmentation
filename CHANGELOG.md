@@ -1,3 +1,24 @@
+## 0.4.0
+
+BUG FIXES:
+
+- `guardicore_policy_rule`: publishing a policy revision is now scoped to the
+  rulesets the change actually touched. Previously the provider sent an empty
+  `rulesets` list, which the API treats as "publish every pending change" — so a
+  `terraform apply` also published unrelated draft rules, including ones created
+  in the UI by other users. The publish scope is now derived from the rules in
+  the batch. ([#9](https://github.com/akamai/terraform-provider-guardicore-segmentation/pull/9))
+
+NOTES:
+
+- Rules with no `ruleset_name` map to the `undefined` sentinel, which the API
+  expands to every pending rule with no ruleset. The provider logs a warning when
+  that happens; set `ruleset_name` on all Terraform-managed policy rules to keep
+  the publish scope narrow.
+- Within a published ruleset, all pending changes are published regardless of who
+  made them. This matches the Web UI, where the ruleset is the unit of publish
+  granularity.
+
 ## 0.3.1
 
 BUG FIXES:
