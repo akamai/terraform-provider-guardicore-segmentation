@@ -26,6 +26,9 @@ description: |-
   }
   
   ~> Reference Validation: Label, label group, user group, asset, policy group, and worksite IDs referenced by typed attributes are validated for existence in Akamai Guardicore Segmentation during plan and apply. Non-existent IDs will produce a clear error before any API call is made.
+  ~> Publishing: Creating, updating or deleting a policy rule automatically publishes a policy revision. The revision is scoped to the rulesets the change touched, so pending changes in other rulesets are left unpublished.
+  ~> Publishing a ruleset publishes everything pending in it, including draft rules created outside Terraform, for example by another user in the Web UI. The ruleset is the unit of publish granularity, exactly as it is in the Web UI; there is no per-rule or per-author publish. To keep Terraform-managed policy isolated from concurrent manual edits, give Terraform its own rulesets.
+  ~> Rules without ruleset_name are published as a group. They belong to the "no ruleset" bucket, and publishing it publishes every pending rule that has no ruleset, including ones created outside Terraform. The provider logs a warning when this happens, so set ruleset_name on all Terraform-managed rules to avoid it.
 ---
 
 # guardicore_policy_rule (Resource)
@@ -56,6 +59,12 @@ Example:
 ```
 
 ~> **Reference Validation:** Label, label group, user group, asset, policy group, and worksite IDs referenced by typed attributes are validated for existence in Akamai Guardicore Segmentation during plan and apply. Non-existent IDs will produce a clear error before any API call is made.
+
+~> **Publishing:** Creating, updating or deleting a policy rule automatically publishes a policy revision. The revision is scoped to the rulesets the change touched, so pending changes in other rulesets are left unpublished.
+
+~> **Publishing a ruleset publishes everything pending in it,** including draft rules created outside Terraform, for example by another user in the Web UI. The ruleset is the unit of publish granularity, exactly as it is in the Web UI; there is no per-rule or per-author publish. To keep Terraform-managed policy isolated from concurrent manual edits, give Terraform its own rulesets.
+
+~> **Rules without `ruleset_name` are published as a group.** They belong to the "no ruleset" bucket, and publishing it publishes every pending rule that has no ruleset, including ones created outside Terraform. The provider logs a warning when this happens, so set `ruleset_name` on all Terraform-managed rules to avoid it.
 
 ## Example Usage
 
@@ -245,7 +254,7 @@ resource "guardicore_policy_rule" "unsupported_extras" {
 - `ports` (List of Number) Explicit ports for the rule.
 - `priority` (Number) Rule priority, when supported by the API.
 - `raw_spec_json` (String) Optional JSON overlay for unsupported top-level extras. Typed attributes take precedence.
-- `ruleset_name` (String) The policy ruleset name.
+- `ruleset_name` (String) The policy ruleset name. This also determines the publish scope: when Terraform publishes a revision, it publishes only the rulesets its changes touched, leaving pending changes in other rulesets unpublished. Publishing a ruleset publishes every pending change in it, including rules created outside Terraform. When omitted, the rule belongs to the "no ruleset" bucket, and publishing that bucket publishes all pending rules with no ruleset — set this attribute on Terraform-managed rules to keep the scope narrow. See the resource description above for details.
 - `schedule` (Attributes) (see [below for nested schema](#nestedatt--schedule))
 - `scope` (List of String) Optional label IDs that scope the rule.
 - `section_position` (String) The policy section where the rule is placed.
