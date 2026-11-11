@@ -1,5 +1,16 @@
 ## 0.4.1
 
+BUG FIXES:
+
+- `guardicore_label`: fix label deletion, which never reached the bulk delete
+  endpoint. The provider sent `DELETE` to `/api/v4.0/labels/bulk_delete`, but
+  that endpoint accepts `POST` only, so the request was routed to the
+  single-label endpoint and answered `404`. Deletion still completed through the
+  provider's fallback to individual deletes, but where an intermediary rejects a
+  `DELETE` carrying a request body the call failed outright with `HTTP 413` and
+  the labels could not be deleted at all.
+  ([#14](https://github.com/akamai/terraform-provider-guardicore-segmentation/pull/14))
+
 DOCUMENTATION:
 
 - `guardicore_policy_rule`: document how the automatic policy revision publish is
