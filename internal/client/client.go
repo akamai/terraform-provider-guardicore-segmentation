@@ -716,13 +716,18 @@ func (c *Client) BulkUpdateLabels(ctx context.Context, labels []LabelUpdate) (*L
 }
 
 // BulkDeleteLabels deletes multiple labels in a single request.
+//
+// The endpoint accepts POST, not DELETE. Sending DELETE routes the request to
+// the single-label endpoint instead, which reads "bulk_delete" as a label ID and
+// answers 404 — or, where an intermediary rejects a DELETE carrying a body,
+// fails outright before reaching the API. Neither deletes anything.
 func (c *Client) BulkDeleteLabels(ctx context.Context, ids []string) (*LabelBulkResponse, error) {
 	items := make([]LabelBulkDeleteItem, len(ids))
 	for i, id := range ids {
 		items[i] = LabelBulkDeleteItem{ID: id}
 	}
 
-	resp, err := c.doRequest(ctx, http.MethodDelete, "/api/v4.0/labels/bulk_delete", items)
+	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v4.0/labels/bulk_delete", items)
 	if err != nil {
 		return nil, err
 	}

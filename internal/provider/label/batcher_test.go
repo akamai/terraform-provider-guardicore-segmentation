@@ -104,7 +104,7 @@ func TestLabelDeleteBatcher_BulkCall(t *testing.T) {
 	bulkDeleteCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/api/v4.0/labels/bulk_delete" && r.Method == http.MethodDelete:
+		case r.URL.Path == "/api/v4.0/labels/bulk_delete" && r.Method == http.MethodPost:
 			bulkDeleteCalls++
 			writeBatcherJSON(t, w, map[string]any{"succeeded": []string{"l1", "l2"}, "failed": []string{}, "missing": []string{}})
 		case strings.HasPrefix(r.URL.Path, "/api/v4.0/labels/") && r.Method == http.MethodGet:
