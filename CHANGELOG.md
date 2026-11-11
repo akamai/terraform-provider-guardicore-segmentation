@@ -1,3 +1,15 @@
+## 0.4.1
+
+DOCUMENTATION:
+
+- `guardicore_policy_rule`: document how the automatic policy revision publish is
+  scoped. 0.4.0 changed this behaviour but described it only in the changelog, so
+  the published documentation was unchanged. The resource and `ruleset_name`
+  descriptions now cover the scoping itself, the fact that publishing a ruleset
+  also publishes pending changes made outside Terraform, and the wider "no
+  ruleset" bucket that rules without `ruleset_name` fall into.
+  ([#13](https://github.com/akamai/terraform-provider-guardicore-segmentation/pull/13))
+
 ## 0.4.0
 
 BUG FIXES:
