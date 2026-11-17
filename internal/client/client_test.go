@@ -882,7 +882,7 @@ func TestClient_CreateLabel_WithInitialDynamicCriteria(t *testing.T) {
 func TestClient_DeleteLabel(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/api/v4.0/labels/bulk_delete" && r.Method == http.MethodDelete:
+		case r.URL.Path == "/api/v4.0/labels/bulk_delete" && r.Method == http.MethodPost:
 			var items []LabelBulkDeleteItem
 			if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
 				t.Fatalf("failed to decode request body: %v", err)
@@ -6580,4 +6580,51 @@ func (e errReadCloser) Read(_ []byte) (int, error) {
 
 func (e errReadCloser) Close() error {
 	return nil
+}
+
+// The bulk label delete endpoint is POST-only. Sending DELETE routes the
+// request to the single-label endpoint, which reads "bulk_delete" as a label ID
+// and answers 404, so nothing is deleted. Where an intermediary rejects a
+// DELETE carrying a body, the request fails before reaching the API at all --
+// the HTTP 413 reported in GC-184628.
+func TestClient_BulkDeleteLabels_UsesPost(t *testing.T) {
+	var gotMethod, gotPath string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+
+		var items []LabelBulkDeleteItem
+		if err := json.NewDecoder(r.Body).Decode(&items); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		if len(items) != 2 {
+			t.Fatalf("expected 2 items, got %d", len(items))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, LabelBulkResponse{
+			Succeeded: []string{items[0].ID, items[1].ID},
+			Failed:    []string{},
+			Missing:   []string{},
+		})
+	}))
+	defer server.Close()
+
+	c := &Client{config: Config{BaseURL: server.URL}, httpClient: http.DefaultClient, token: "test-token"}
+
+	resp, err := c.BulkDeleteLabels(context.Background(), []string{"label-1", "label-2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Errorf("expected method POST, got %q", gotMethod)
+	}
+	if gotPath != "/api/v4.0/labels/bulk_delete" {
+		t.Errorf("expected path '/api/v4.0/labels/bulk_delete', got %q", gotPath)
+	}
+	if len(resp.Succeeded) != 2 {
+		t.Errorf("expected 2 succeeded, got %d", len(resp.Succeeded))
+	}
 }
