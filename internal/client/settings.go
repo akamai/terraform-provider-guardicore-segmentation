@@ -14,6 +14,10 @@ const (
 	DefaultRequestRetryMaxDelay   = 2 * time.Second
 	DefaultAuthMaxRetries         = 2
 	DefaultAuthRetryBaseDelay     = 500 * time.Millisecond
+
+	// DefaultPublishComment is recorded against revisions the provider
+	// publishes when no publish_comment is configured.
+	DefaultPublishComment = "Published via Terraform"
 )
 
 var (

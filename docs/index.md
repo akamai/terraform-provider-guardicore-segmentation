@@ -52,7 +52,29 @@ provider "guardicore" {
 #   strict_references_on_destroy   = true
 # }
 
-# Example 5: Use environment variables instead of explicit configuration
+# Example 5: Custom publish comment
+#
+# Creating, updating or deleting policy rules or user groups automatically
+# publishes a revision. By default the comment reads "Published via Terraform".
+# Set publish_comment to tie each publication to a change request, deployment
+# reference or pipeline run, so the change is traceable in the Guardicore
+# publication history.
+#
+# provider "guardicore" {
+#   base_url        = "https://guardicore.example.com"
+#   access_token    = var.guardicore_access_token
+#   publish_comment = "CHG0045231 - add application bubble RTEST4"
+# }
+#
+# In CI, supply it from the environment so the pipeline injects its own run
+# identifier without editing configuration:
+#
+#   export GUARDICORE_PUBLISH_COMMENT="terraform apply - pipeline #${CI_RUN_ID}"
+#
+# The comment applies to every revision published during the run. It is not a
+# per-resource setting, because one revision can cover many resources.
+
+# Example 6: Use environment variables instead of explicit configuration
 # provider "guardicore" {}
 #
 # Supported environment variables:
@@ -63,6 +85,7 @@ provider "guardicore" {
 # - GUARDICORE_REFRESH_TOKEN
 # - GUARDICORE_INSECURE_SKIP_VERIFY
 # - GUARDICORE_REQUEST_TIMEOUT
+# - GUARDICORE_PUBLISH_COMMENT
 
 variable "guardicore_username" {
   description = "Username for Akamai Guardicore Segmentation authentication"
@@ -102,6 +125,7 @@ variable "guardicore_refresh_token" {
 - `base_url` (String) The base URL of the Akamai Guardicore Segmentation API (e.g., https://guardicore.example.com). Can also be set via GUARDICORE_BASE_URL environment variable.
 - `insecure_skip_verify` (Boolean) Skip TLS certificate verification. Can also be set via GUARDICORE_INSECURE_SKIP_VERIFY environment variable. **Warning:** Disabling verification exposes connections to man-in-the-middle attacks. Only use this for development or testing environments with self-signed certificates.
 - `password` (String, Sensitive) Password for Akamai Guardicore Segmentation authentication. Can also be set via GUARDICORE_PASSWORD environment variable.
+- `publish_comment` (String) Comment recorded against the policy and user group revisions this provider publishes. Use it to tie a publication to a change request, deployment reference or pipeline run, so Terraform-driven changes are traceable in the Guardicore publication history. Applies to every revision the provider publishes during a run; it is not per-resource, because a single revision can cover many resources. Can also be set via the GUARDICORE_PUBLISH_COMMENT environment variable, which is usually how a CI pipeline supplies its run identifier. Defaults to "Published via Terraform".
 - `refresh_token` (String, Sensitive) Refresh token for Akamai Guardicore Segmentation authentication. Can also be set via GUARDICORE_REFRESH_TOKEN environment variable.
 - `request_timeout` (Number) Timeout in seconds for individual HTTP requests to the Akamai Guardicore Segmentation API. This applies per-request, not per-operation (paginated operations make multiple requests, each with this timeout). Can also be set via GUARDICORE_REQUEST_TIMEOUT environment variable. Default: 30.
 - `strict_references_on_destroy` (Boolean) When true, block destruction of resources that are still referenced by other resources. Implies validate_references_on_destroy. Default: false.

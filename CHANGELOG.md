@@ -1,4 +1,16 @@
-## 0.4.1
+## 0.5.0
+
+FEATURES:
+
+- Provider: add an optional `publish_comment` attribute, also settable via the
+  `GUARDICORE_PUBLISH_COMMENT` environment variable. The comment is recorded
+  against the policy and user group revisions the provider publishes, so a
+  publication can be tied to a change request, deployment reference or pipeline
+  run and traced in the Guardicore publication history. It applies to every
+  revision published during a run rather than per-resource, because one revision
+  can cover many resources. Existing configurations are unaffected: when unset,
+  the comment remains "Published via Terraform".
+  ([#15](https://github.com/akamai/terraform-provider-guardicore-segmentation/pull/15))
 
 BUG FIXES:
 

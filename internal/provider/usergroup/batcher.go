@@ -73,7 +73,7 @@ func NewUserGroupDeleteBatcher(c *client.Client, tuning client.BatcherTuning) *c
 func userGroupPublish[Req any](c *client.Client) func(context.Context, []Req) error {
 	return func(ctx context.Context, _ []Req) error {
 		return c.CreateUserGroupRevision(ctx, &client.UserGroupRevisionRequest{
-			Comments: "Published via Terraform",
+			Comments: c.PublishComment(),
 		})
 	}
 }

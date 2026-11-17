@@ -1058,3 +1058,75 @@ func TestIncludesUnassigned(t *testing.T) {
 		})
 	}
 }
+
+// GC-185246: the publish comment is configurable so a publication can be tied
+// to a change request or pipeline run. It must reach the revision request body.
+func TestPolicyRuleCreateBatcher_PublishCommentIsConfigurable(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "default when unset", configured: "", want: "Published via Terraform"},
+		{name: "custom comment", configured: "CHG0045231 - bubble RTEST4", want: "CHG0045231 - bubble RTEST4"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var gotComment string
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v4.0/visibility/policy/rules/bulk":
+					var specs []map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&specs); err != nil {
+						t.Errorf("failed to decode bulk request: %v", err)
+					}
+					succeeded := make([]string, len(specs))
+					for i := range specs {
+						succeeded[i] = fmt.Sprintf("rule-%d", i+1)
+					}
+					writeBatcherJSON(t, w, client.PolicyRulesBulkCreateResponse{
+						NumberOfSucceeded: len(specs), Result: "success",
+						Succeeded: succeeded, TotalNumber: len(specs),
+					})
+				case "/api/v4.0/visibility/policy/revisions":
+					var req client.PolicyRevisionRequest
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						t.Errorf("failed to decode publish request: %v", err)
+					}
+					mu.Lock()
+					gotComment = req.Comments
+					mu.Unlock()
+					w.WriteHeader(http.StatusCreated)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			apiClient, err := client.NewClient(client.Config{
+				BaseURL: server.URL, AccessToken: "test-token", PublishComment: tt.configured,
+			})
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+
+			batcher := NewPolicyRuleCreateBatcher(apiClient, client.BatcherTuning{})
+			if _, err := batcher.Enqueue(context.Background(), map[string]any{
+				"action": "ALLOW", "section_position": "ALLOW",
+				"source": map[string]any{}, "destination": map[string]any{},
+				"ruleset_name": "tf-test-a",
+			}); err != nil {
+				t.Fatalf("unexpected enqueue error: %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if gotComment != tt.want {
+				t.Errorf("expected publish comment %q, got %q", tt.want, gotComment)
+			}
+		})
+	}
+}

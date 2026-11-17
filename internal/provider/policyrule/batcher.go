@@ -138,7 +138,7 @@ func policyRulePublish[Req any](c *client.Client, rulesetOf func(Req) string) fu
 
 		revisionOrigin := "API_CALL"
 		return c.CreatePolicyRevision(ctx, &client.PolicyRevisionRequest{
-			Comments: "Published via Terraform",
+			Comments: c.PublishComment(),
 			Rulesets: rulesets,
 			Origin:   &revisionOrigin,
 		})

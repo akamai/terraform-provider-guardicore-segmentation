@@ -6628,3 +6628,23 @@ func TestClient_BulkDeleteLabels_UsesPost(t *testing.T) {
 		t.Errorf("expected 2 succeeded, got %d", len(resp.Succeeded))
 	}
 }
+
+func TestClient_PublishComment(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "defaults when unset", configured: "", want: DefaultPublishComment},
+		{name: "uses configured value", configured: "CHG0045231 - deploy bubble", want: "CHG0045231 - deploy bubble"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &Client{config: Config{PublishComment: tt.configured}}
+			if got := c.PublishComment(); got != tt.want {
+				t.Errorf("expected %q, got %q", tt.want, got)
+			}
+		})
+	}
+}

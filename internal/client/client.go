@@ -230,6 +230,9 @@ type Config struct {
 	InsecureSkipVerify bool
 	RequestTimeout     int64 // HTTP request timeout in seconds; 0 uses DefaultRequestTimeout
 	RuntimeSettings    *RuntimeSettings
+	// PublishComment is recorded against policy and user group revisions the
+	// provider publishes. Empty means DefaultPublishComment.
+	PublishComment string
 }
 
 // Client is the Akamai Guardicore Segmentation API client.
@@ -284,6 +287,15 @@ func NewClient(config Config) (*Client, error) {
 
 func (c *Client) runtimeSettings() RuntimeSettings {
 	return ResolveRuntimeSettings(&c.settings)
+}
+
+// PublishComment returns the comment to record against revisions the provider
+// publishes, falling back to DefaultPublishComment when none is configured.
+func (c *Client) PublishComment() string {
+	if c.config.PublishComment == "" {
+		return DefaultPublishComment
+	}
+	return c.config.PublishComment
 }
 
 // authenticateIfStale re-authenticates only if the current token matches staleToken.
