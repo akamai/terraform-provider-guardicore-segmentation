@@ -48,6 +48,7 @@ type GuardicoreProviderModel struct {
 	RequestTimeout        types.Int64  `tfsdk:"request_timeout"`
 	ValidateRefsOnDestroy types.Bool   `tfsdk:"validate_references_on_destroy"`
 	StrictRefsOnDestroy   types.Bool   `tfsdk:"strict_references_on_destroy"`
+	PublishComment        types.String `tfsdk:"publish_comment"`
 }
 
 func (p *GuardicoreProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -106,6 +107,15 @@ func (p *GuardicoreProvider) Schema(ctx context.Context, req provider.SchemaRequ
 					"Implies validate_references_on_destroy. Default: false.",
 				Optional: true,
 			},
+			"publish_comment": schema.StringAttribute{
+				MarkdownDescription: "Comment recorded against the policy and user group revisions this provider publishes. " +
+					"Use it to tie a publication to a change request, deployment reference or pipeline run, so Terraform-driven " +
+					"changes are traceable in the Guardicore publication history. Applies to every revision the provider publishes " +
+					"during a run; it is not per-resource, because a single revision can cover many resources. " +
+					"Can also be set via the GUARDICORE_PUBLISH_COMMENT environment variable, which is usually how a CI pipeline " +
+					"supplies its run identifier. Defaults to \"Published via Terraform\".",
+				Optional: true,
+			},
 		},
 	}
 }
@@ -126,6 +136,7 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 	accessToken := getStringValue(data.AccessToken, "GUARDICORE_ACCESS_TOKEN")
 	refreshToken := getStringValue(data.RefreshToken, "GUARDICORE_REFRESH_TOKEN")
 	insecureSkipVerify := getBoolValue(data.InsecureSkipVerify, "GUARDICORE_INSECURE_SKIP_VERIFY")
+	publishComment := getStringValue(data.PublishComment, "GUARDICORE_PUBLISH_COMMENT")
 
 	if baseURL == "" {
 		resp.Diagnostics.AddAttributeError(
@@ -214,6 +225,7 @@ func (p *GuardicoreProvider) Configure(ctx context.Context, req provider.Configu
 		InsecureSkipVerify: insecureSkipVerify,
 		RequestTimeout:     requestTimeout,
 		RuntimeSettings:    nil,
+		PublishComment:     publishComment,
 	}
 	runtime := client.ResolveRuntimeSettings(config.RuntimeSettings)
 	assetLabelIgnoreCache := common.NewAssetLabelIgnoreCache()
